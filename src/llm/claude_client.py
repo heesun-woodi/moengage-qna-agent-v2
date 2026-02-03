@@ -208,67 +208,6 @@ class ClaudeClient:
 
     @retry_claude_api
     @claude_circuit
-    async def generate_improvement(
-        self,
-        current_code: str,
-        improvement_request: str,
-        file_path: str,
-        model: Optional[str] = None
-    ) -> str:
-        """Generate improved code based on user request.
-
-        Args:
-            current_code: Current file content
-            improvement_request: User's improvement request
-            file_path: Path to the file being improved
-            model: Model to use
-
-        Returns:
-            Improved code string
-        """
-        from src.bot.improvement_handler import IMPROVEMENT_SYSTEM_PROMPT
-
-        model = model or self.DEFAULT_MODEL
-
-        response = await self.async_client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=IMPROVEMENT_SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"""## 파일
-{file_path}
-
-## 현재 코드
-```python
-{current_code}
-```
-
-## 개선 요청
-{improvement_request}
-
-## 지시사항
-위 요청에 따라 코드를 개선하고, 수정된 전체 파일 내용을 반환해주세요.
-"""
-                }
-            ]
-        )
-
-        content = response.content[0].text.strip()
-
-        # Remove markdown code blocks
-        if content.startswith("```python"):
-            content = content[9:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-
-        return content.strip()
-
-    @retry_claude_api
-    @claude_circuit
     async def extract_learning_points(
         self,
         original_query: str,

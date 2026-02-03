@@ -54,13 +54,6 @@ class Settings(BaseSettings):
     # CSM Response Channel - where bot posts answers for CSM review
     csm_response_channel_id: str = Field(default="", env="CSM_RESPONSE_CHANNEL_ID")
 
-    # Agent Self-Improvement Feature
-    improvement_enabled: bool = Field(default=True, env="IMPROVEMENT_ENABLED")
-    improvement_allowed_files: str = Field(
-        default="src/llm/prompts.py,src/bot/formatters.py,src/llm/query_optimizer.py",
-        env="IMPROVEMENT_ALLOWED_FILES"
-    )
-
     def is_csm_channel(self, channel_id: str) -> bool:
         """Check if channel is a CSM internal channel."""
         if not self.csm_channel_ids:

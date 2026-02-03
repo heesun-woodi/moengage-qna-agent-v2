@@ -45,7 +45,6 @@ from src.llm.thread_analyzer import analyze_slack_thread, detect_resolution_keyw
 from src.llm.grounding_validator import validate_and_filter_response
 from src.llm.query_optimizer import analyze_query
 from src.utils.logger import logger
-from src.bot.improvement_handler import handle_improve_command, handle_improvement_approval
 from src.bot.history_command import handle_history_command
 
 # In-memory store for active CSM ticket sessions
@@ -102,11 +101,6 @@ def register_handlers(app: AsyncApp):
 
         # Handle complete emoji
         elif reaction == settings.complete_emoji:
-            # First check if this is an improvement approval
-            if await handle_improvement_approval(client, channel, message_ts, user):
-                logger.info(f"Processed improvement approval for {channel}/{message_ts}")
-                return
-            # Otherwise, handle as normal complete emoji (archive to history)
             await handle_complete_emoji(client, channel, message_ts, user)
 
         # Handle feedback emojis
@@ -475,12 +469,6 @@ async def handle_csm_mention(
 
     if not user_query:
         logger.debug("Empty query after removing bot mention")
-        return
-
-    # Check for /improve command
-    if user_query.startswith('/improve') or user_query.startswith('/개선'):
-        logger.info(f"[CSM MENTION] Processing improve command: {user_query[:100]}...")
-        await handle_improve_command(client, event, user_query)
         return
 
     # Check for /history command
