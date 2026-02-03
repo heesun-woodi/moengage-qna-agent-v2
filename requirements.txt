@@ -1,0 +1,39 @@
+# Slack Bot
+slack-bolt>=1.18.0
+slack-sdk>=3.21.0
+
+# HTTP Client
+httpx>=0.25.0
+aiohttp>=3.9.0
+
+# Vector Database (History RAG) - FAISS based
+faiss-cpu>=1.7.0
+sentence-transformers>=2.2.0
+numpy>=1.21.0
+
+# LLM
+anthropic>=0.25.0
+
+# HTML Parsing
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Caching & State Management
+cachetools>=5.3.0
+redis>=5.0.0
+
+# Configuration
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Utilities
+tenacity>=8.2.0  # Retry logic
+
+# PDF Processing
+pdfplumber>=0.10.0  # PDF text/image extraction
+Pillow>=10.0.0  # Image processing
+
+# Development
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
