@@ -63,8 +63,9 @@ pytest -v tests/test_file.py::test_function  # Single test
    - `hybrid_searcher.py`: MoEngage API + History RAG 병렬 검색 및 결과 병합
    - `moengage_api.py`: MoEngage Help Center API 클라이언트
    - `history_rag.py`: FAISS 기반 내부 지원 이력 RAG
-   - `history_api_client.py`: Railway FAISS API 원격 클라이언트
-   - `learning_store.py`: 학습 데이터 저장/조회
+   - `history_api_client.py`: Railway History API 원격 클라이언트
+   - `learning_store.py`: 학습 데이터 저장/조회 (로컬 + Railway)
+   - `learning_api_client.py`: Railway Learning API 원격 클라이언트
 
 2. **LLM** (`src/llm/`)
    - `claude_client.py`: Anthropic Claude API (답변 생성, 학습 추출, CSM 피드백 분석)
@@ -100,8 +101,8 @@ pytest -v tests/test_file.py::test_function  # Single test
 
 3. **티켓 완료** (✅ 이모지) → `handle_complete_emoji()`
    - `extract_learning_points()` → Claude로 학습 포인트 추출
-   - `add_from_slack_thread()` → History DB 저장
-   - `save_learning_entry()` → Learning Store 저장
+   - `add_from_slack_thread()` → History DB 저장 (로컬 + Railway)
+   - `save_learning_entry()` → Learning Store 저장 (로컬 + Railway)
 
 ## Configuration
 

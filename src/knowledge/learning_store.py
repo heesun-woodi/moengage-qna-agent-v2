@@ -3,7 +3,7 @@
 import hashlib
 import pickle
 import json
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +35,7 @@ from src.knowledge.history_updater import (
     ResponseEvolution,
     SearchIteration,
 )
+from src.knowledge.learning_api_client import get_learning_api_client, is_learning_api_configured
 
 
 class LearningStore:
@@ -191,7 +192,7 @@ class LearningStore:
         query: str,
         top_k: int = 5,
         min_score: float = 0.3
-    ) -> List[tuple[LearningEntry, float]]:
+    ) -> List[Tuple[LearningEntry, float]]:
         """Search for similar learning entries.
 
         Args:
@@ -396,7 +397,7 @@ class InMemoryLearningStore:
 
         return entry_id
 
-    def search(self, query: str, top_k: int = 5, min_score: float = 0.3) -> List[tuple[LearningEntry, float]]:
+    def search(self, query: str, top_k: int = 5, min_score: float = 0.3) -> List[Tuple[LearningEntry, float]]:
         if not self._entries:
             return []
 
@@ -524,6 +525,8 @@ def get_learning_store():
 async def save_learning_entry(entry: LearningEntry) -> str:
     """Async wrapper for saving a learning entry.
 
+    Saves to both local FAISS store and Railway API if configured.
+
     Args:
         entry: LearningEntry to save
 
@@ -531,7 +534,24 @@ async def save_learning_entry(entry: LearningEntry) -> str:
         Entry ID
     """
     store = get_learning_store()
-    return store.add_entry(entry)
+    entry_id = store.add_entry(entry)
+    logger.info(f"Saved learning entry to local store: {entry_id}")
+
+    # Also save to Railway if configured
+    if is_learning_api_configured():
+        try:
+            api_client = get_learning_api_client()
+            if api_client:
+                entry.id = entry_id  # Use same ID for consistency
+                remote_id = await api_client.add_entry(entry.to_dict())
+                if remote_id:
+                    logger.info(f"Saved learning entry to Railway: {remote_id}")
+                else:
+                    logger.warning(f"Failed to save learning to Railway, local save successful: {entry_id}")
+        except Exception as e:
+            logger.error(f"Railway Learning API error (local save successful): {e}")
+
+    return entry_id
 
 
 async def get_learning_for_query(query: str, top_k: int = 3) -> Dict[str, Any]:

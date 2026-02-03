@@ -5,6 +5,7 @@ from datetime import datetime
 from dataclasses import dataclass, field
 
 from src.knowledge.history_rag import get_history_rag, HistoryEntry
+from src.knowledge.history_api_client import get_history_api_client, is_remote_api_configured
 from src.utils.logger import logger
 
 
@@ -329,7 +330,21 @@ async def add_resolved_case(case: ResolvedCase) -> str:
     )
 
     entry_id = rag.add_entry(entry)
-    logger.info(f"Added resolved case to history: {case.title} (ID: {entry_id})")
+    logger.info(f"Added resolved case to local history: {case.title} (ID: {entry_id})")
+
+    # Also save to Railway if configured
+    if is_remote_api_configured():
+        try:
+            api_client = get_history_api_client()
+            if api_client:
+                entry.id = entry_id  # Use same ID for consistency
+                remote_id = await api_client.add_entry(entry)
+                if remote_id:
+                    logger.info(f"Added resolved case to Railway: {case.title} (ID: {remote_id})")
+                else:
+                    logger.warning(f"Failed to save to Railway, local save successful: {entry_id}")
+        except Exception as e:
+            logger.error(f"Railway API error (local save successful): {e}")
 
     return entry_id
 
