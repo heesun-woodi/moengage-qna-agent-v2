@@ -1,6 +1,8 @@
 """Slack event handlers for emoji reactions and app mentions."""
 
 import re
+import asyncio
+import time
 from typing import Dict, Any, Optional
 from datetime import datetime
 
@@ -50,6 +52,25 @@ from src.bot.history_command import handle_history_command
 # In-memory store for active CSM ticket sessions
 # Maps: csm_thread_ts -> session_data
 _csm_sessions: Dict[str, Dict[str, Any]] = {}
+_session_lock = asyncio.Lock()
+
+# Session TTL in seconds (24 hours)
+SESSION_TTL_SECONDS = 86400
+
+
+async def cleanup_stale_sessions():
+    """Remove sessions older than TTL."""
+    async with _session_lock:
+        cutoff = time.time() - SESSION_TTL_SECONDS
+        stale = [
+            k for k, v in _csm_sessions.items()
+            if v.get("created_at_ts", 0) < cutoff
+        ]
+        for k in stale:
+            del _csm_sessions[k]
+            logger.info(f"Cleaned up stale session: {k}")
+        if stale:
+            logger.info(f"Cleaned up {len(stale)} stale sessions")
 
 # PDF import related imports (lazy loaded)
 PDF_IMPORTER_AVAILABLE = False
@@ -241,11 +262,12 @@ async def handle_ticket_emoji(
         logger.info(f"Skipping ticket processing for {channel}/{message_ts} - already processed")
         return
 
-    # Check if CSM response channel is configured
+    # Check if CSM response channel is configured (required for v2)
     csm_response_channel = settings.csm_response_channel_id
     if not csm_response_channel:
-        logger.warning("CSM_RESPONSE_CHANNEL_ID not configured, falling back to original channel")
-        csm_response_channel = channel
+        logger.error("CSM_RESPONSE_CHANNEL_ID not configured - this is required for v2")
+        await set_message_state(channel, message_ts, MessageState.IDLE)
+        return
 
     # Set state to processing
     await set_message_state(channel, message_ts, MessageState.PROCESSING)
@@ -381,27 +403,43 @@ async def handle_ticket_emoji(
             text=formatted_response
         )
 
+        # Validate post result
+        if not post_result.get("ok", True):  # Slack SDK may not include 'ok' on success
+            error_msg = post_result.get("error", "Unknown error")
+            logger.error(f"Failed to post to CSM channel: {error_msg}")
+            await set_message_state(channel, message_ts, MessageState.IDLE)
+            return
+
         csm_thread_ts = post_result.get("ts", "")
+        if not csm_thread_ts:
+            logger.error("No timestamp returned from chat_postMessage")
+            await set_message_state(channel, message_ts, MessageState.IDLE)
+            return
 
         # Store session data for CSM conversation
-        _csm_sessions[csm_thread_ts] = {
-            "original_channel": channel,
-            "original_ts": message_ts,
-            "original_query": user_query,
-            "channel_name": channel_name,
-            "context": context,
-            "search_results": search_results,
-            "initial_response": final_response,
-            "iteration_count": 0,
-            "feedback": [],
-            "improved_responses": [],
-            "search_queries": [user_query, optimized_query] if optimized_query != user_query else [user_query],
-            "search_results_titles": [r.title for r in search_results],
-            "referenced_docs": referenced_docs,
-            "referenced_history": referenced_history,
-            "created_at": datetime.now().isoformat(),
-            "query_analysis": query_analysis,
-        }
+        async with _session_lock:
+            _csm_sessions[csm_thread_ts] = {
+                "original_channel": channel,
+                "original_ts": message_ts,
+                "original_query": user_query,
+                "channel_name": channel_name,
+                "context": context,
+                "search_results": search_results,
+                "initial_response": final_response,
+                "iteration_count": 0,
+                "feedback": [],
+                "improved_responses": [],
+                "search_queries": [user_query, optimized_query] if optimized_query != user_query else [user_query],
+                "search_results_titles": [r.title for r in search_results],
+                "referenced_docs": referenced_docs,
+                "referenced_history": referenced_history,
+                "created_at": datetime.now().isoformat(),
+                "created_at_ts": time.time(),  # For TTL cleanup
+                "query_analysis": query_analysis,
+            }
+
+        # Periodic cleanup of stale sessions
+        asyncio.create_task(cleanup_stale_sessions())
 
         # Create feedback entry for tracking
         feedback_store = get_feedback_store()
@@ -632,9 +670,10 @@ async def handle_csm_thread_reply(
         intent = analysis.get("intent", "other")
         logger.info(f"CSM intent: {intent}")
 
-        # Update session with feedback
-        session["feedback"].append(csm_message)
-        session["iteration_count"] += 1
+        # Update session with feedback (thread-safe)
+        async with _session_lock:
+            session["feedback"].append(csm_message)
+            session["iteration_count"] += 1
 
         # Handle different intents
         if intent == "approval":
@@ -682,8 +721,9 @@ async def handle_csm_thread_reply(
             additional_context=additional_context
         )
 
-        # Store improved response
-        session["improved_responses"].append(improved_response)
+        # Store improved response (thread-safe)
+        async with _session_lock:
+            session["improved_responses"].append(improved_response)
 
         # Format and post the improved response
         iteration = session["iteration_count"]
@@ -917,15 +957,27 @@ async def handle_complete_emoji(
                 iteration_count=session["iteration_count"],
             )
 
-            # Save learning entry
-            try:
-                learning_entry_id = await save_learning_entry(learning_entry)
-                logger.info(f"Saved learning entry: {learning_entry_id}")
-            except Exception as e:
-                logger.error(f"Failed to save learning entry: {e}")
+            # Only save if we have actual learning content
+            has_learning_content = any([
+                learning_points_dict.get("query_lesson"),
+                learning_points_dict.get("search_lesson"),
+                learning_points_dict.get("response_lesson"),
+            ])
 
-            # Clean up session
-            del _csm_sessions[message_ts]
+            if has_learning_content:
+                # Save learning entry
+                try:
+                    learning_entry_id = await save_learning_entry(learning_entry)
+                    logger.info(f"Saved learning entry: {learning_entry_id}")
+                except Exception as e:
+                    logger.error(f"Failed to save learning entry: {e}")
+            else:
+                logger.warning("Skipping learning entry save - no learning content extracted")
+
+            # Clean up session (thread-safe)
+            async with _session_lock:
+                if message_ts in _csm_sessions:
+                    del _csm_sessions[message_ts]
 
         # Post confirmation
         if entry_id:

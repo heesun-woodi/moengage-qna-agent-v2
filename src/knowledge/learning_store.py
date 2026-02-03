@@ -1,7 +1,6 @@
 """Learning Store - Storage and retrieval of learning data from CSM conversations."""
 
 import hashlib
-import pickle
 import json
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
@@ -63,7 +62,9 @@ class LearningStore:
         base_dir = Path(persist_dir or settings.chroma_persist_dir)
         self.persist_dir = base_dir / "learning"
         self.index_path = self.persist_dir / "learning_faiss.index"
-        self.metadata_path = self.persist_dir / "learning_metadata.pkl"
+        self.metadata_path = self.persist_dir / "learning_metadata.json"
+        # Legacy pickle path for migration
+        self._legacy_metadata_path = self.persist_dir / "learning_metadata.pkl"
 
         # Load embedding model (reuse from history_rag if possible)
         logger.info(f"Loading embedding model for learning store: {self.EMBEDDING_MODEL}")
@@ -79,8 +80,8 @@ class LearningStore:
         if self.index_path.exists() and self.metadata_path.exists():
             try:
                 self.index = faiss.read_index(str(self.index_path))
-                with open(self.metadata_path, 'rb') as f:
-                    data = pickle.load(f)
+                with open(self.metadata_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
                     self.entries: Dict[str, LearningEntry] = {}
                     # Convert dict back to LearningEntry objects
                     for k, v in data.get('entries', {}).items():
@@ -92,9 +93,41 @@ class LearningStore:
                 logger.info(f"Loaded existing learning index with {self.index.ntotal} vectors")
             except Exception as e:
                 logger.error(f"Failed to load existing learning index: {e}")
+                # Try legacy pickle format for migration
+                if self._try_load_legacy():
+                    logger.info("Migrated learning store from legacy pickle format")
+                    self._save()
+                else:
+                    self._create_new_index()
+        elif self.index_path.exists() and self._legacy_metadata_path.exists():
+            # Legacy format exists, migrate it
+            if self._try_load_legacy():
+                logger.info("Migrated learning store from legacy pickle format")
+                self._save()
+            else:
                 self._create_new_index()
         else:
             self._create_new_index()
+
+    def _try_load_legacy(self) -> bool:
+        """Try to load legacy pickle format for migration."""
+        try:
+            import pickle
+            if self._legacy_metadata_path.exists():
+                self.index = faiss.read_index(str(self.index_path))
+                with open(self._legacy_metadata_path, 'rb') as f:
+                    data = pickle.load(f)
+                    self.entries = {}
+                    for k, v in data.get('entries', {}).items():
+                        if isinstance(v, dict):
+                            self.entries[k] = LearningEntry.from_dict(v)
+                        else:
+                            self.entries[k] = v
+                    self.id_to_idx = data.get('id_to_idx', {})
+                return True
+        except Exception as e:
+            logger.error(f"Failed to load legacy pickle: {e}")
+        return False
 
     def _create_new_index(self):
         """Create new empty index."""
@@ -108,13 +141,13 @@ class LearningStore:
         """Save index and metadata to disk."""
         try:
             faiss.write_index(self.index, str(self.index_path))
-            # Convert LearningEntry to dict for serialization
+            # Convert LearningEntry to dict for JSON serialization
             entries_dict = {k: v.to_dict() for k, v in self.entries.items()}
-            with open(self.metadata_path, 'wb') as f:
-                pickle.dump({
+            with open(self.metadata_path, 'w', encoding='utf-8') as f:
+                json.dump({
                     'entries': entries_dict,
                     'id_to_idx': self.id_to_idx
-                }, f)
+                }, f, ensure_ascii=False, indent=2)
             logger.debug("Saved learning index and metadata")
         except Exception as e:
             logger.error(f"Failed to save learning index: {e}")
@@ -191,7 +224,7 @@ class LearningStore:
         self,
         query: str,
         top_k: int = 5,
-        min_score: float = 0.3
+        min_score: float = 0.5
     ) -> List[Tuple[LearningEntry, float]]:
         """Search for similar learning entries.
 

@@ -327,8 +327,8 @@ def get_learning_extraction_prompt(
 위 대화에서 학습 포인트를 추출해주세요. JSON 형식으로 출력하세요."""
 
 
-# CSM reply analysis prompt for understanding CSM intent
-CSM_REPLY_ANALYSIS_PROMPT = """당신은 CSM의 피드백을 분석하는 전문가입니다.
+# CSM reply analysis system prompt for understanding CSM intent
+CSM_REPLY_ANALYSIS_SYSTEM_PROMPT = """당신은 CSM의 피드백을 분석하는 전문가입니다.
 
 ## 역할
 CSM이 봇 답변에 대해 남긴 피드백을 분석하여 의도를 파악합니다.

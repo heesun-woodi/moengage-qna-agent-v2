@@ -1,12 +1,18 @@
 """History API - REST endpoints for remote history entry management."""
 
 import json
+import secrets
 from datetime import datetime
 from typing import Optional
 
 from aiohttp import web
 
 from config.settings import settings
+
+# Input validation constants
+MAX_TITLE_LENGTH = 500
+MAX_QUERY_LENGTH = 5000
+MAX_SOLUTION_LENGTH = 10000
 from src.knowledge.history_rag import get_history_rag, HistoryEntry
 from src.knowledge.learning_store import get_learning_store
 from src.knowledge.history_updater import LearningEntry
@@ -29,15 +35,69 @@ def verify_api_key(request: web.Request) -> bool:
     auth_header = request.headers.get("Authorization", "")
     expected = f"Bearer {settings.history_api_key}"
 
-    return auth_header == expected
+    # Use constant-time comparison to prevent timing attacks
+    return secrets.compare_digest(auth_header, expected)
 
 
 async def health_check(request: web.Request) -> web.Response:
-    """GET /api/health - Health check endpoint."""
+    """GET /api/health - Comprehensive health check endpoint."""
+    checks = {}
+
+    # Check History RAG
+    try:
+        rag = get_history_rag()
+        checks["history_rag"] = {
+            "status": "ok",
+            "entries": rag.count()
+        }
+    except Exception as e:
+        checks["history_rag"] = {
+            "status": "error",
+            "error": str(e)
+        }
+
+    # Check Learning Store
+    try:
+        store = get_learning_store()
+        checks["learning_store"] = {
+            "status": "ok",
+            "entries": store.count()
+        }
+    except Exception as e:
+        checks["learning_store"] = {
+            "status": "error",
+            "error": str(e)
+        }
+
+    # Check configuration
+    config_ok = all([
+        settings.slack_bot_token,
+        settings.slack_app_token,
+        settings.anthropic_api_key,
+        settings.csm_response_channel_id
+    ])
+    checks["configuration"] = {
+        "status": "ok" if config_ok else "warning",
+        "csm_channel_configured": bool(settings.csm_response_channel_id)
+    }
+
+    # Determine overall status
+    all_ok = all(c.get("status") == "ok" for c in checks.values())
+    any_error = any(c.get("status") == "error" for c in checks.values())
+
+    if any_error:
+        overall_status = "error"
+    elif all_ok:
+        overall_status = "ok"
+    else:
+        overall_status = "degraded"
+
     return web.json_response({
-        "status": "ok",
+        "status": overall_status,
         "service": "moengage-qna-agent",
-        "api_enabled": settings.history_api_enabled
+        "version": "2.0",
+        "api_enabled": settings.history_api_enabled,
+        "checks": checks
     })
 
 
@@ -53,20 +113,31 @@ async def get_history_stats(request: web.Request) -> web.Response:
             "persist_dir": str(getattr(rag, 'persist_dir', 'N/A'))
         })
     except Exception as e:
-        logger.error(f"API: Error getting stats: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        logger.error(f"API: Error getting stats: {e}", exc_info=True)
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 
 async def list_history_entries(request: web.Request) -> web.Response:
-    """GET /api/history - List all history entries."""
+    """GET /api/history - List all history entries with pagination."""
     if not verify_api_key(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     try:
-        rag = get_history_rag()
-        entries = []
+        # Parse pagination parameters
+        limit = int(request.query.get("limit", 100))
+        offset = int(request.query.get("offset", 0))
+        # Enforce limits
+        limit = max(1, min(limit, 1000))
+        offset = max(0, offset)
 
-        for entry_id, entry in rag.entries.items():
+        rag = get_history_rag()
+        total = rag.count()
+
+        all_entries = list(rag.entries.items())
+        paginated = all_entries[offset:offset + limit]
+
+        entries = []
+        for entry_id, entry in paginated:
             entries.append({
                 "id": entry_id,
                 "title": entry.title,
@@ -79,11 +150,15 @@ async def list_history_entries(request: web.Request) -> web.Response:
 
         return web.json_response({
             "count": len(entries),
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "has_more": offset + limit < total,
             "entries": entries
         })
     except Exception as e:
-        logger.error(f"API: Error listing entries: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        logger.error(f"API: Error listing entries: {e}", exc_info=True)
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 
 async def add_history_entry(request: web.Request) -> web.Response:
@@ -122,6 +197,23 @@ async def add_history_entry(request: web.Request) -> web.Response:
             status=400
         )
 
+    # Validate field lengths
+    if len(data.get("title", "")) > MAX_TITLE_LENGTH:
+        return web.json_response(
+            {"error": f"Title exceeds maximum length of {MAX_TITLE_LENGTH}"},
+            status=400
+        )
+    if len(data.get("query_summary", "")) > MAX_QUERY_LENGTH:
+        return web.json_response(
+            {"error": f"Query summary exceeds maximum length of {MAX_QUERY_LENGTH}"},
+            status=400
+        )
+    if len(data.get("solution", "")) > MAX_SOLUTION_LENGTH:
+        return web.json_response(
+            {"error": f"Solution exceeds maximum length of {MAX_SOLUTION_LENGTH}"},
+            status=400
+        )
+
     try:
         # Create HistoryEntry
         entry = HistoryEntry(
@@ -154,8 +246,8 @@ async def add_history_entry(request: web.Request) -> web.Response:
         })
 
     except Exception as e:
-        logger.error(f"API: Error adding entry: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        logger.error(f"API: Error adding entry: {e}", exc_info=True)
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 
 async def get_learning_stats(request: web.Request) -> web.Response:
@@ -168,8 +260,8 @@ async def get_learning_stats(request: web.Request) -> web.Response:
         stats = store.get_statistics()
         return web.json_response(stats)
     except Exception as e:
-        logger.error(f"API: Error getting learning stats: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        logger.error(f"API: Error getting learning stats: {e}", exc_info=True)
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 
 async def list_learning_entries(request: web.Request) -> web.Response:
@@ -179,10 +271,18 @@ async def list_learning_entries(request: web.Request) -> web.Response:
 
     try:
         limit = int(request.query.get("limit", 100))
+        offset = int(request.query.get("offset", 0))
+        # Enforce limits
+        limit = max(1, min(limit, 1000))
+        offset = max(0, offset)
         store = get_learning_store()
         entries = []
+        total = store.count()
 
-        for entry_id, entry in list(store.entries.items())[:limit]:
+        all_entries = list(store.entries.items())
+        paginated = all_entries[offset:offset + limit]
+
+        for entry_id, entry in paginated:
             entries.append({
                 "id": entry_id,
                 "original_query": entry.original_query[:200],
@@ -199,12 +299,15 @@ async def list_learning_entries(request: web.Request) -> web.Response:
 
         return web.json_response({
             "count": len(entries),
-            "total": store.count(),
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "has_more": offset + limit < total,
             "entries": entries
         })
     except Exception as e:
-        logger.error(f"API: Error listing learning entries: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        logger.error(f"API: Error listing learning entries: {e}", exc_info=True)
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 
 async def add_learning_entry(request: web.Request) -> web.Response:
@@ -246,8 +349,8 @@ async def add_learning_entry(request: web.Request) -> web.Response:
         })
 
     except Exception as e:
-        logger.error(f"API: Error adding learning entry: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        logger.error(f"API: Error adding learning entry: {e}", exc_info=True)
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 
 def create_api_app() -> web.Application:

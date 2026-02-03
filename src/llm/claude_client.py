@@ -2,8 +2,43 @@
 
 from typing import Optional, AsyncGenerator, List, Dict
 import json
+import re
 
 import anthropic
+
+
+def extract_json_safely(text: str) -> dict:
+    """Robust JSON extraction from LLM response.
+
+    Tries multiple patterns to extract JSON from text that may include
+    markdown code blocks or other formatting.
+
+    Args:
+        text: Raw text containing JSON
+
+    Returns:
+        Parsed dictionary or empty dict on failure
+    """
+    patterns = [
+        r'```json\s*([\s\S]*?)\s*```',  # ```json ... ```
+        r'```\s*([\s\S]*?)\s*```',       # ``` ... ```
+        r'\{[\s\S]*\}',                   # Raw { ... }
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                json_str = match.group(1) if '```' in pattern else match.group(0)
+                return json.loads(json_str.strip())
+            except (json.JSONDecodeError, IndexError):
+                continue
+
+    # Last resort: try parsing the entire text
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        return {}
 
 from config.settings import settings
 from src.utils.logger import logger
@@ -13,7 +48,7 @@ from src.llm.prompts import (
     THREAD_ANALYZER_SYSTEM_PROMPT,
     CSM_CONVERSATIONAL_PROMPT,
     LEARNING_EXTRACTION_SYSTEM_PROMPT,
-    CSM_REPLY_ANALYSIS_PROMPT,
+    CSM_REPLY_ANALYSIS_SYSTEM_PROMPT,
     get_support_prompt,
     get_thread_analysis_prompt,
     get_learning_extraction_prompt,
@@ -106,22 +141,13 @@ class ClaudeClient:
 
         result_text = response.content[0].text
 
-        # Parse JSON from response
-        try:
-            # Try to extract JSON from the response
-            if "```json" in result_text:
-                json_str = result_text.split("```json")[1].split("```")[0]
-            elif "```" in result_text:
-                json_str = result_text.split("```")[1].split("```")[0]
-            else:
-                json_str = result_text
-
-            result = json.loads(json_str.strip())
+        # Parse JSON from response using robust extraction
+        result = extract_json_safely(result_text)
+        if result:
             logger.info(f"Thread analysis complete: {result.get('title', 'N/A')}")
             return result
-
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse thread analysis JSON: {e}")
+        else:
+            logger.error("Failed to parse thread analysis JSON")
             return {
                 "title": "분석 실패",
                 "category": "기타",
@@ -252,21 +278,13 @@ class ClaudeClient:
 
         result_text = response.content[0].text
 
-        # Parse JSON from response
-        try:
-            if "```json" in result_text:
-                json_str = result_text.split("```json")[1].split("```")[0]
-            elif "```" in result_text:
-                json_str = result_text.split("```")[1].split("```")[0]
-            else:
-                json_str = result_text
-
-            result = json.loads(json_str.strip())
+        # Parse JSON from response using robust extraction
+        result = extract_json_safely(result_text)
+        if result:
             logger.info(f"Extracted learning points: {list(result.keys())}")
             return result
-
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse learning points JSON: {e}")
+        else:
+            logger.error("Failed to parse learning points JSON")
             return {
                 "query_lesson": "",
                 "search_lesson": "",
@@ -300,7 +318,7 @@ class ClaudeClient:
         response = await self.async_client.messages.create(
             model=model,
             max_tokens=512,
-            system=CSM_REPLY_ANALYSIS_PROMPT,
+            system=CSM_REPLY_ANALYSIS_SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -308,21 +326,13 @@ class ClaudeClient:
 
         result_text = response.content[0].text
 
-        # Parse JSON from response
-        try:
-            if "```json" in result_text:
-                json_str = result_text.split("```json")[1].split("```")[0]
-            elif "```" in result_text:
-                json_str = result_text.split("```")[1].split("```")[0]
-            else:
-                json_str = result_text
-
-            result = json.loads(json_str.strip())
+        # Parse JSON from response using robust extraction
+        result = extract_json_safely(result_text)
+        if result:
             logger.info(f"CSM reply intent: {result.get('intent', 'unknown')}")
             return result
-
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse CSM reply analysis JSON: {e}")
+        else:
+            logger.error("Failed to parse CSM reply analysis JSON")
             return {
                 "intent": "other",
                 "keywords": [],

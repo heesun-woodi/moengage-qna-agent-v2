@@ -9,6 +9,47 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.bot.app import run_app
 from src.utils.logger import logger
+from config.settings import settings
+
+
+def validate_configuration():
+    """Validate required configuration at startup.
+
+    Raises:
+        ValueError: If required configuration is missing
+    """
+    errors = []
+
+    # Required Slack tokens
+    if not settings.slack_bot_token:
+        errors.append("SLACK_BOT_TOKEN is required")
+    elif not settings.slack_bot_token.startswith("xoxb-"):
+        errors.append("SLACK_BOT_TOKEN must start with 'xoxb-'")
+
+    if not settings.slack_app_token:
+        errors.append("SLACK_APP_TOKEN is required for Socket Mode")
+    elif not settings.slack_app_token.startswith("xapp-"):
+        errors.append("SLACK_APP_TOKEN must start with 'xapp-'")
+
+    # Required API key
+    if not settings.anthropic_api_key:
+        errors.append("ANTHROPIC_API_KEY is required")
+
+    # v2 Required: CSM response channel
+    if not settings.csm_response_channel_id:
+        errors.append(
+            "CSM_RESPONSE_CHANNEL_ID is required for v2. "
+            "This is the channel where bot posts responses for CSM review."
+        )
+    elif not settings.csm_response_channel_id.startswith("C"):
+        errors.append(
+            "CSM_RESPONSE_CHANNEL_ID must be a valid Slack channel ID (starts with 'C')"
+        )
+
+    if errors:
+        for error in errors:
+            logger.error(f"Configuration error: {error}")
+        raise ValueError(f"Configuration validation failed: {'; '.join(errors)}")
 
 
 def log_history_entries():
@@ -51,7 +92,15 @@ def log_history_entries():
 
 def main():
     """Main entry point."""
-    logger.info("Starting MoEngage Q&A Agent...")
+    logger.info("Starting MoEngage Q&A Agent v2...")
+
+    # Validate configuration before starting
+    try:
+        validate_configuration()
+        logger.info("Configuration validation passed")
+    except ValueError as e:
+        logger.error(f"Startup aborted: {e}")
+        sys.exit(1)
 
     # Log stored history entries
     log_history_entries()

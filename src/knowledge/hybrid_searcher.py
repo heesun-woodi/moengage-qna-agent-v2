@@ -62,9 +62,9 @@ async def hybrid_search(
             logger.warning(f"Query optimization failed, using original: {e}")
             optimized_query = query
 
-    # Run searches in parallel with optimized query
+    # Run searches in parallel with optimized query for both sources
     moengage_task = search_moengage(optimized_query, top_k=moengage_top_k)
-    history_task = search_history(query, top_k=history_top_k)  # Use original for history
+    history_task = search_history(optimized_query, top_k=history_top_k)  # Use optimized for consistency
 
     try:
         moengage_results, history_results = await asyncio.gather(
@@ -115,16 +115,18 @@ async def hybrid_search(
                 }
             ))
 
-    # Add MoEngage results
-    for mr in moengage_results:
+    # Add MoEngage results with rank-based scoring
+    for i, mr in enumerate(moengage_results):
+        # Higher rank = higher score (0.9 for first, decreasing by 0.03)
+        score = max(0.7, 0.9 - (i * 0.03))
         unified_results.append(UnifiedSearchResult(
             title=mr.title,
             url=mr.url,
             content=mr.content,
             snippet=mr.snippet,
             source="moengage_docs",
-            score=0.9,  # Default score for API results
-            metadata={}
+            score=score,
+            metadata={"rank": i + 1}
         ))
 
     # Add history results last if not prioritizing
