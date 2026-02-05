@@ -140,7 +140,8 @@ def format_csm_ticket_response(
     original_channel: str,
     original_ts: str,
     search_results: Optional[List[UnifiedSearchResult]] = None,
-    was_modified: bool = False
+    was_modified: bool = False,
+    channel_name: str = ""
 ) -> str:
     """Format a ticket response for CSM channel with original message link.
 
@@ -151,6 +152,7 @@ def format_csm_ticket_response(
         original_ts: Timestamp of original message
         search_results: Search results used for the response
         was_modified: Whether the response was modified by grounding validation
+        channel_name: Name of the original channel
 
     Returns:
         Formatted Slack message for CSM channel
@@ -158,9 +160,10 @@ def format_csm_ticket_response(
     # Generate message permalink
     message_link = f"https://slack.com/archives/{original_channel}/p{original_ts.replace('.', '')}"
 
-    # Build header with original query context
+    # Build header with channel name and original query context
+    channel_display = f"**#{channel_name}**" if channel_name else ""
     header = (
-        f"📋 **새로운 문의**\n\n"
+        f"📋 **새로운 문의** {channel_display}\n\n"
         f"**원본 메시지**: <{message_link}|슬랙에서 보기>\n\n"
         f"**고객 문의 내용**:\n>{original_query[:500]}{'...' if len(original_query) > 500 else ''}\n\n"
         f"---\n\n"

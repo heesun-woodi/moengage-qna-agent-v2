@@ -40,6 +40,7 @@ from src.llm.claude_client import (
     generate_response,
     generate_csm_response,
     extract_learning_points,
+    extract_learning_from_thread,
     analyze_csm_reply,
     generate_improved_response
 )
@@ -394,7 +395,8 @@ async def handle_ticket_emoji(
             channel,
             message_ts,
             search_results,
-            was_modified
+            was_modified,
+            channel_name=channel_name
         )
 
         # Post response to CSM channel as a new message (not thread)
@@ -888,11 +890,15 @@ async def handle_complete_emoji(
             csm_metadata=csm_metadata
         )
 
-        # V2: Extract and save learning points if we have a session with improvements
+        # V2: Extract and save learning points from conversation
         learning_entry_id = None
         learning_points_dict = {}
 
+        # Extract original query from first message
+        original_query = messages[0].get("text", "") if messages else ""
+
         if session and session.get("iteration_count", 0) > 0:
+            # Case 1: Session exists with improvements - use session data
             logger.info(f"Extracting learning points from {session['iteration_count']} iterations")
 
             # Get final response
@@ -901,6 +907,7 @@ async def handle_complete_emoji(
                 if session["improved_responses"]
                 else session["initial_response"]
             )
+            original_query = session["original_query"]
 
             # Extract learning points using Claude
             try:
@@ -911,36 +918,74 @@ async def handle_complete_emoji(
                     improved_responses=session.get("improved_responses", []),
                     final_response=final_response
                 )
-                logger.info(f"Extracted learning points: {learning_points_dict}")
+                logger.info(f"Extracted learning points from session: {learning_points_dict}")
             except Exception as e:
-                logger.warning(f"Failed to extract learning points: {e}")
+                logger.warning(f"Failed to extract learning points from session: {e}")
                 learning_points_dict = {}
 
-            # Create LearningEntry
+            # Clean up session (thread-safe)
+            async with _session_lock:
+                if message_ts in _csm_sessions:
+                    del _csm_sessions[message_ts]
+        else:
+            # Case 2: No session or no improvements - extract from thread messages
+            logger.info(f"Extracting learning points from thread messages ({len(messages)} messages)")
+
+            try:
+                learning_points_dict = await extract_learning_from_thread(messages)
+                logger.info(f"Extracted learning points from thread: {learning_points_dict}")
+            except Exception as e:
+                logger.warning(f"Failed to extract learning points from thread: {e}")
+                learning_points_dict = {}
+
+        # Create and save LearningEntry if we have learning content
+        has_learning_content = any([
+            learning_points_dict.get("query_lesson"),
+            learning_points_dict.get("search_lesson"),
+            learning_points_dict.get("response_lesson"),
+        ])
+
+        if has_learning_content:
+            # Get responses from messages for learning entry
+            bot_responses = [m.get("text", "") for m in messages if m.get("bot_id")]
+            user_messages = [m.get("text", "") for m in messages if not m.get("bot_id")]
+
+            initial_response = bot_responses[0] if bot_responses else ""
+            final_response = bot_responses[-1] if bot_responses else ""
+
+            # Use session data if available, otherwise use parsed messages
+            if session:
+                initial_response = session.get("initial_response", initial_response)
+                final_response = (
+                    session["improved_responses"][-1]
+                    if session.get("improved_responses")
+                    else session.get("initial_response", final_response)
+                )
+
             learning_entry = LearningEntry(
-                original_query=session["original_query"],
-                original_channel=session.get("original_channel", ""),
-                original_ts=session.get("original_ts", ""),
+                original_query=original_query,
+                original_channel=session.get("original_channel", channel) if session else channel,
+                original_ts=session.get("original_ts", message_ts) if session else message_ts,
                 csm_thread_channel=channel,
                 csm_thread_ts=message_ts,
                 query_interpretation=QueryInterpretation(
-                    initial=session["original_query"],
-                    corrections=session.get("feedback", [])[:3],  # First 3 as corrections
-                    final=session["original_query"],  # Could be refined
+                    initial=original_query,
+                    corrections=user_messages[1:4] if len(user_messages) > 1 else [],
+                    final=original_query,
                 ),
                 search_history=SearchHistory(
-                    initial_queries=session.get("search_queries", [])[:2],
-                    initial_results=session.get("search_results_titles", [])[:5],
+                    initial_queries=session.get("search_queries", [original_query])[:2] if session else [original_query],
+                    initial_results=session.get("search_results_titles", [])[:5] if session else [],
                     additional_searches=[
                         SearchIteration(query=q, results=[])
-                        for q in session.get("search_queries", [])[2:]
+                        for q in (session.get("search_queries", [])[2:] if session else [])
                     ],
                     used_documents=referenced_docs[:5],
                 ),
                 response_evolution=ResponseEvolution(
-                    initial_response=session["initial_response"],
-                    feedback=session.get("feedback", []),
-                    iterations=session.get("improved_responses", []),
+                    initial_response=initial_response,
+                    feedback=session.get("feedback", user_messages[1:]) if session else user_messages[1:],
+                    iterations=session.get("improved_responses", bot_responses[1:]) if session else bot_responses[1:],
                     final_response=final_response,
                 ),
                 learning_points=LearningPoints(
@@ -950,55 +995,25 @@ async def handle_complete_emoji(
                 ),
                 customer=customer,
                 category=learning_points_dict.get("category", "기타"),
-                created_at=session.get("created_at", datetime.now().isoformat()),
+                created_at=session.get("created_at", datetime.now().isoformat()) if session else datetime.now().isoformat(),
                 completed_at=datetime.now().isoformat(),
                 csm_user_id=csm_metadata.get("csm_user_id", ""),
                 csm_user_name=csm_metadata.get("csm_real_name", ""),
-                iteration_count=session["iteration_count"],
+                iteration_count=session.get("iteration_count", 0) if session else len(bot_responses) - 1,
             )
 
-            # Only save if we have actual learning content
-            has_learning_content = any([
-                learning_points_dict.get("query_lesson"),
-                learning_points_dict.get("search_lesson"),
-                learning_points_dict.get("response_lesson"),
-            ])
+            # Save learning entry
+            try:
+                learning_entry_id = await save_learning_entry(learning_entry)
+                logger.info(f"Saved learning entry: {learning_entry_id}")
+            except Exception as e:
+                logger.error(f"Failed to save learning entry: {e}")
+        else:
+            logger.info("No learning content extracted from conversation")
 
-            if has_learning_content:
-                # Save learning entry
-                try:
-                    learning_entry_id = await save_learning_entry(learning_entry)
-                    logger.info(f"Saved learning entry: {learning_entry_id}")
-                except Exception as e:
-                    logger.error(f"Failed to save learning entry: {e}")
-            else:
-                logger.warning("Skipping learning entry save - no learning content extracted")
-
-            # Clean up session (thread-safe)
-            async with _session_lock:
-                if message_ts in _csm_sessions:
-                    del _csm_sessions[message_ts]
-
-        # Post confirmation
+        # Update state (no confirmation message sent to keep thread clean)
         if entry_id:
-            if learning_entry_id and learning_points_dict:
-                # Enhanced confirmation with learning points
-                confirmation = format_learning_saved_confirmation(
-                    entry_id,
-                    learning_points_dict
-                )
-            else:
-                confirmation = f"✅ 이 문의 내용이 지원 히스토리에 저장되었습니다. (ID: {entry_id[:8]}...)"
-
-            await client.chat_postMessage(
-                channel=channel,
-                thread_ts=message_ts,
-                text=confirmation
-            )
-
-            # Update state to completed
             await set_message_state(channel, message_ts, MessageState.COMPLETED)
-
             logger.info(f"Archived thread to history: {entry_id}, learning: {learning_entry_id}")
         else:
             logger.warning(f"Failed to archive thread {channel}/{message_ts}")

@@ -499,6 +499,57 @@ async def analyze_csm_reply(csm_message: str, conversation_context: str = "") ->
     return await client.analyze_csm_reply(csm_message, conversation_context)
 
 
+async def extract_learning_from_thread(thread_messages: list) -> dict:
+    """Extract learning points from a completed thread conversation.
+
+    Analyzes the thread messages to identify:
+    - Original query and how it was interpreted
+    - What search/information gathering was done
+    - How the response was formulated
+    - Key takeaways for future similar queries
+
+    Args:
+        thread_messages: List of Slack message dicts from the thread
+
+    Returns:
+        Dictionary with query_lesson, search_lesson, response_lesson, category
+    """
+    # Parse thread messages to extract conversation flow
+    original_query = ""
+    bot_responses = []
+    user_messages = []
+
+    for msg in thread_messages:
+        text = msg.get("text", "")
+        if not text:
+            continue
+
+        if msg.get("bot_id"):
+            bot_responses.append(text[:1000])  # Limit length
+        else:
+            if not original_query:
+                original_query = text
+            else:
+                user_messages.append(text[:500])
+
+    if not original_query or not bot_responses:
+        logger.warning("Thread has insufficient content for learning extraction")
+        return {}
+
+    # Build conversation summary for learning extraction
+    initial_response = bot_responses[0] if bot_responses else ""
+    final_response = bot_responses[-1] if bot_responses else ""
+
+    # Use the existing extract_learning_points function
+    return await extract_learning_points(
+        original_query=original_query,
+        initial_response=initial_response,
+        csm_feedback=user_messages,
+        improved_responses=bot_responses[1:] if len(bot_responses) > 1 else [],
+        final_response=final_response
+    )
+
+
 async def generate_improved_response(
     context: str,
     original_query: str,
