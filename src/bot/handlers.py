@@ -35,7 +35,7 @@ from src.knowledge.history_updater import (
     SearchIteration
 )
 from src.knowledge.feedback_store import get_feedback_store
-from src.knowledge.learning_store import get_learning_store, save_learning_entry
+from src.knowledge.learning_store import get_learning_store, save_learning_entry, get_learning_for_query
 from src.llm.claude_client import (
     generate_response,
     generate_csm_response,
@@ -380,6 +380,19 @@ async def handle_ticket_emoji(
         referenced_docs = [r.url for r in search_results if r.source == "moengage_docs"]
         referenced_history = [r.url for r in search_results if r.source == "support_history"]
 
+        # Inject learning data from similar past cases
+        try:
+            learning_data = await get_learning_for_query(user_query, top_k=3)
+            if learning_data.get("has_learning"):
+                learning_context = _format_learning_context(learning_data)
+                context = f"{context}\n\n{learning_context}"
+                similar_count = len(learning_data.get("similar_queries", []))
+                logger.info(f"[LEARNING] Added learning context from {similar_count} similar cases")
+            else:
+                logger.info("[LEARNING] No similar learning data found")
+        except Exception as e:
+            logger.warning(f"[LEARNING] Failed to get learning data: {e}")
+
         # Generate response with Claude (use enhanced query with URL/image context)
         response = await generate_response(context, enhanced_query if analyzed_content else user_query)
 
@@ -627,6 +640,38 @@ def _format_thread_context(messages: list, current_ts: str) -> str:
             context_parts.append(f"[사용자 질문]\n{text[:500]}")
 
     return "\n\n".join(context_parts[-5:])  # Keep last 5 messages for context
+
+
+def _format_learning_context(learning_data: dict) -> str:
+    """Format learning data as context section for LLM.
+
+    Args:
+        learning_data: Dictionary with learning lessons from similar cases
+
+    Returns:
+        Formatted learning context string
+    """
+    sections = ["## 유사 사례에서의 학습"]
+
+    # 답변 작성 교훈 (가장 중요)
+    if learning_data.get("response_lessons"):
+        sections.append("\n**답변 작성 시 참고:**")
+        for lesson in learning_data["response_lessons"][:2]:
+            sections.append(f"- {lesson['lesson']}")
+
+    # 문의 해석 교훈
+    if learning_data.get("query_lessons"):
+        sections.append("\n**문의 해석 시 참고:**")
+        for lesson in learning_data["query_lessons"][:2]:
+            sections.append(f"- {lesson['lesson']}")
+
+    # 검색 전략 교훈
+    if learning_data.get("search_lessons"):
+        sections.append("\n**검색 전략 참고:**")
+        for lesson in learning_data["search_lessons"][:2]:
+            sections.append(f"- {lesson['lesson']}")
+
+    return "\n".join(sections)
 
 
 async def handle_csm_thread_reply(
