@@ -181,7 +181,7 @@ def format_csm_ticket_response(
     footer = (
         "\n\n---\n"
         "_💡 답변이 불충분하면 이 스레드에서 추가 질문을 해주세요._\n"
-        "_✅ 최종 답변이 완성되면 원본 메시지에 :white_check_mark: 이모지를 추가해주세요._"
+        "_✅ 최종 답변이 완성되면 원본 메시지에 :완료: 이모지를 추가해주세요._"
     )
 
     return header + formatted_response + footer
