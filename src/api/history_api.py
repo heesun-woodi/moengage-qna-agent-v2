@@ -161,6 +161,48 @@ async def list_history_entries(request: web.Request) -> web.Response:
         return web.json_response({"error": "Internal server error"}, status=500)
 
 
+async def export_history_entries(request: web.Request) -> web.Response:
+    """GET /api/history/export - Export all history entries with full data."""
+    if not verify_api_key(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    try:
+        from dataclasses import asdict
+        rag = get_history_rag()
+        entries = []
+        for entry_id, entry in rag.entries.items():
+            entry_dict = asdict(entry) if hasattr(entry, '__dict__') else entry
+            entries.append(entry_dict)
+
+        return web.json_response({
+            "count": len(entries),
+            "entries": entries
+        })
+    except Exception as e:
+        logger.error(f"API: Error exporting entries: {e}", exc_info=True)
+        return web.json_response({"error": "Internal server error"}, status=500)
+
+
+async def export_learning_entries(request: web.Request) -> web.Response:
+    """GET /api/learning/export - Export all learning entries with full data."""
+    if not verify_api_key(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    try:
+        store = get_learning_store()
+        entries = []
+        for entry_id, entry in store.entries.items():
+            entries.append(entry.to_dict())
+
+        return web.json_response({
+            "count": len(entries),
+            "entries": entries
+        })
+    except Exception as e:
+        logger.error(f"API: Error exporting learning entries: {e}", exc_info=True)
+        return web.json_response({"error": "Internal server error"}, status=500)
+
+
 async def add_history_entry(request: web.Request) -> web.Response:
     """POST /api/history - Add a new history entry.
 
@@ -365,11 +407,13 @@ def create_api_app() -> web.Application:
     app.router.add_get("/api/health", health_check)
     app.router.add_get("/api/history", list_history_entries)
     app.router.add_get("/api/history/stats", get_history_stats)
+    app.router.add_get("/api/history/export", export_history_entries)
     app.router.add_post("/api/history", add_history_entry)
 
     # Learning routes
     app.router.add_get("/api/learning", list_learning_entries)
     app.router.add_get("/api/learning/stats", get_learning_stats)
+    app.router.add_get("/api/learning/export", export_learning_entries)
     app.router.add_post("/api/learning", add_learning_entry)
 
     logger.info("History & Learning API routes registered")

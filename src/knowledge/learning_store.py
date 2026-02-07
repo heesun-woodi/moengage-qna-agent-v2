@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import tempfile
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ except ImportError:
 
 from config.settings import settings
 from src.utils.logger import logger
+from src.storage import get_storage_backend, StorageBackend
 from src.knowledge.history_updater import (
     LearningEntry,
     LearningPoints,
@@ -47,11 +49,12 @@ class LearningStore:
     EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
     EMBEDDING_DIM = 384
 
-    def __init__(self, persist_dir: Optional[str] = None):
+    def __init__(self, persist_dir: Optional[str] = None, storage: Optional[StorageBackend] = None):
         """Initialize Learning Store.
 
         Args:
-            persist_dir: Directory to persist data
+            persist_dir: Directory to persist data (for local storage)
+            storage: Storage backend to use (if None, uses configured backend)
         """
         if not FAISS_AVAILABLE:
             raise RuntimeError("FAISS is not available. Install with: pip install faiss-cpu")
@@ -59,12 +62,19 @@ class LearningStore:
         if not SENTENCE_TRANSFORMERS_AVAILABLE:
             raise RuntimeError("sentence-transformers is not available.")
 
+        # Use provided storage or get configured backend
+        self.storage = storage or get_storage_backend()
+
+        # Path prefixes for storage
+        self.index_path = "learning/learning_faiss.index"
+        self.metadata_path = "learning/learning_metadata.json"
+
+        # Legacy paths (for local storage migration)
         base_dir = Path(persist_dir or settings.chroma_persist_dir)
         self.persist_dir = base_dir / "learning"
-        self.index_path = self.persist_dir / "learning_faiss.index"
-        self.metadata_path = self.persist_dir / "learning_metadata.json"
-        # Legacy pickle path for migration
+        self._legacy_index_path = self.persist_dir / "learning_faiss.index"
         self._legacy_metadata_path = self.persist_dir / "learning_metadata.pkl"
+        self._legacy_json_path = self.persist_dir / "learning_metadata.json"
 
         # Load embedding model (reuse from history_rag if possible)
         logger.info(f"Loading embedding model for learning store: {self.EMBEDDING_MODEL}")
@@ -77,53 +87,68 @@ class LearningStore:
 
     def _load_or_create(self):
         """Load existing index or create new one."""
-        if self.index_path.exists() and self.metadata_path.exists():
+        # Try to load from storage backend first
+        if self.storage.exists(self.index_path) and self.storage.exists(self.metadata_path):
             try:
-                self.index = faiss.read_index(str(self.index_path))
-                with open(self.metadata_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.entries: Dict[str, LearningEntry] = {}
-                    # Convert dict back to LearningEntry objects
-                    for k, v in data.get('entries', {}).items():
-                        if isinstance(v, dict):
-                            self.entries[k] = LearningEntry.from_dict(v)
-                        else:
-                            self.entries[k] = v
-                    self.id_to_idx: Dict[str, int] = data.get('id_to_idx', {})
-                logger.info(f"Loaded existing learning index with {self.index.ntotal} vectors")
+                # Load FAISS index from bytes
+                index_bytes = self.storage.read_bytes(self.index_path)
+                if index_bytes:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.index') as tmp:
+                        tmp.write(index_bytes)
+                        tmp.flush()
+                        self.index = faiss.read_index(tmp.name)
+
+                    # Load metadata
+                    data = self.storage.read_json(self.metadata_path)
+                    if data:
+                        self._parse_metadata(data)
+                        logger.info(f"Loaded learning index from storage with {self.index.ntotal} vectors")
+                        return
             except Exception as e:
-                logger.error(f"Failed to load existing learning index: {e}")
-                # Try legacy pickle format for migration
-                if self._try_load_legacy():
-                    logger.info("Migrated learning store from legacy pickle format")
-                    self._save()
-                else:
-                    self._create_new_index()
-        elif self.index_path.exists() and self._legacy_metadata_path.exists():
-            # Legacy format exists, migrate it
+                logger.error(f"Failed to load learning from storage backend: {e}")
+
+        # Try legacy local JSON format
+        if self._legacy_json_path.exists() and self._legacy_index_path.exists():
+            try:
+                self.index = faiss.read_index(str(self._legacy_index_path))
+                with open(self._legacy_json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self._parse_metadata(data)
+                logger.info("Loaded from legacy JSON format, migrating to storage backend...")
+                self._save()
+                return
+            except Exception as e:
+                logger.error(f"Failed to load legacy learning JSON: {e}")
+
+        # Try legacy pickle format
+        if self._legacy_metadata_path.exists() and self._legacy_index_path.exists():
             if self._try_load_legacy():
                 logger.info("Migrated learning store from legacy pickle format")
                 self._save()
+                return
+
+        # Create new index if nothing found
+        self._create_new_index()
+
+    def _parse_metadata(self, data: dict):
+        """Parse metadata dict and reconstruct LearningEntry objects."""
+        self.entries: Dict[str, LearningEntry] = {}
+        for k, v in data.get('entries', {}).items():
+            if isinstance(v, dict):
+                self.entries[k] = LearningEntry.from_dict(v)
             else:
-                self._create_new_index()
-        else:
-            self._create_new_index()
+                self.entries[k] = v
+        self.id_to_idx: Dict[str, int] = data.get('id_to_idx', {})
 
     def _try_load_legacy(self) -> bool:
         """Try to load legacy pickle format for migration."""
         try:
             import pickle
-            if self._legacy_metadata_path.exists():
-                self.index = faiss.read_index(str(self.index_path))
+            if self._legacy_metadata_path.exists() and self._legacy_index_path.exists():
+                self.index = faiss.read_index(str(self._legacy_index_path))
                 with open(self._legacy_metadata_path, 'rb') as f:
                     data = pickle.load(f)
-                    self.entries = {}
-                    for k, v in data.get('entries', {}).items():
-                        if isinstance(v, dict):
-                            self.entries[k] = LearningEntry.from_dict(v)
-                        else:
-                            self.entries[k] = v
-                    self.id_to_idx = data.get('id_to_idx', {})
+                    self._parse_metadata(data)
                 return True
         except Exception as e:
             logger.error(f"Failed to load legacy pickle: {e}")
@@ -138,17 +163,25 @@ class LearningStore:
         logger.info("Created new learning index")
 
     def _save(self):
-        """Save index and metadata to disk."""
+        """Save index and metadata to storage backend."""
         try:
-            faiss.write_index(self.index, str(self.index_path))
+            # Save FAISS index to temp file then upload bytes
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.index') as tmp:
+                faiss.write_index(self.index, tmp.name)
+                tmp.flush()
+                with open(tmp.name, 'rb') as f:
+                    index_bytes = f.read()
+                self.storage.write_bytes(self.index_path, index_bytes)
+
             # Convert LearningEntry to dict for JSON serialization
             entries_dict = {k: v.to_dict() for k, v in self.entries.items()}
-            with open(self.metadata_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'entries': entries_dict,
-                    'id_to_idx': self.id_to_idx
-                }, f, ensure_ascii=False, indent=2)
-            logger.debug("Saved learning index and metadata")
+            metadata = {
+                'entries': entries_dict,
+                'id_to_idx': self.id_to_idx
+            }
+            self.storage.write_json(self.metadata_path, metadata)
+
+            logger.info(f"Saved learning index and metadata to storage ({len(self.entries)} entries)")
         except Exception as e:
             logger.error(f"Failed to save learning index: {e}")
 
@@ -224,7 +257,7 @@ class LearningStore:
         self,
         query: str,
         top_k: int = 5,
-        min_score: float = 0.5
+        min_score: float = 0.3  # Lowered from 0.5 to improve initial stage matching
     ) -> List[Tuple[LearningEntry, float]]:
         """Search for similar learning entries.
 
@@ -588,14 +621,159 @@ async def save_learning_entry(entry: LearningEntry) -> str:
 
 
 async def get_learning_for_query(query: str, top_k: int = 3) -> Dict[str, Any]:
-    """Async wrapper for getting learning points.
+    """Get learning points from local store and optionally merge with Railway.
 
     Args:
         query: Customer query
         top_k: Number of similar entries to consider
 
     Returns:
-        Aggregated learning points
+        Aggregated learning points from local + remote sources
     """
     store = get_learning_store()
-    return store.get_learning_points_for_query(query, top_k)
+    local_result = store.get_learning_points_for_query(query, top_k)
+
+    # Try to get remote learning data if configured
+    if is_learning_api_configured():
+        try:
+            remote_result = await _fetch_remote_learning(query, top_k)
+            if remote_result and remote_result.get("has_learning"):
+                local_result = _merge_learning_results(local_result, remote_result)
+                logger.info("[LEARNING] Merged local + remote learning data")
+        except Exception as e:
+            logger.warning(f"[LEARNING] Remote fetch failed, using local only: {e}")
+
+    return local_result
+
+
+async def _fetch_remote_learning(query: str, top_k: int) -> Optional[Dict[str, Any]]:
+    """Fetch learning data from Railway API.
+
+    Note: Railway API doesn't have semantic search, so we fetch recent entries
+    and do client-side filtering based on keywords.
+    """
+    api_client = get_learning_api_client()
+    if not api_client:
+        return None
+
+    try:
+        # Fetch recent entries from Railway
+        result = await api_client.list_entries(limit=50)
+        if not result or not result.get("entries"):
+            return None
+
+        # Simple keyword matching for now
+        # (Full semantic search would require Railway-side embedding)
+        query_lower = query.lower()
+        matched_entries = []
+
+        for entry_dict in result.get("entries", []):
+            entry_query = entry_dict.get("original_query", "").lower()
+            # Simple overlap score
+            query_words = set(query_lower.split())
+            entry_words = set(entry_query.split())
+            if not query_words:
+                continue
+            overlap = len(query_words & entry_words)
+            if overlap >= 2:  # At least 2 words match
+                matched_entries.append((entry_dict, overlap / len(query_words)))
+
+        if not matched_entries:
+            return {"has_learning": False}
+
+        # Sort by score and take top_k
+        matched_entries.sort(key=lambda x: x[1], reverse=True)
+        matched_entries = matched_entries[:top_k]
+
+        # Format as learning result
+        return _format_remote_entries_as_learning(matched_entries)
+
+    except Exception as e:
+        logger.warning(f"Remote learning fetch error: {e}")
+        return None
+
+
+def _format_remote_entries_as_learning(entries: list) -> Dict[str, Any]:
+    """Format remote entries as learning result dict."""
+    if not entries:
+        return {"has_learning": False}
+
+    query_lessons = []
+    search_lessons = []
+    response_lessons = []
+    similar_queries = []
+
+    for entry_dict, score in entries:
+        lp = entry_dict.get("learning_points", {})
+
+        if lp.get("query_lesson"):
+            query_lessons.append({
+                "lesson": lp["query_lesson"],
+                "score": score,
+                "original_query": entry_dict.get("original_query", "")[:100],
+            })
+        if lp.get("search_lesson"):
+            search_lessons.append({
+                "lesson": lp["search_lesson"],
+                "score": score,
+            })
+        if lp.get("response_lesson"):
+            response_lessons.append({
+                "lesson": lp["response_lesson"],
+                "score": score,
+            })
+
+        similar_queries.append({
+            "query": entry_dict.get("original_query", "")[:200],
+            "final_response": entry_dict.get("response_evolution", {}).get("final_response", "")[:500],
+            "score": score,
+        })
+
+    return {
+        "has_learning": True,
+        "query_lessons": query_lessons,
+        "search_lessons": search_lessons,
+        "response_lessons": response_lessons,
+        "similar_queries": similar_queries,
+        "source": "remote",
+    }
+
+
+def _merge_learning_results(local: Dict[str, Any], remote: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge local and remote learning results, deduplicating by lesson text."""
+    if not local.get("has_learning") and not remote.get("has_learning"):
+        return {"has_learning": False}
+
+    # Combine and deduplicate
+    seen_lessons: set = set()
+
+    def dedupe_lessons(local_list: list, remote_list: list) -> list:
+        result = []
+        for item in local_list + remote_list:
+            lesson_text = item.get("lesson", "")
+            if lesson_text and lesson_text not in seen_lessons:
+                seen_lessons.add(lesson_text)
+                result.append(item)
+        # Sort by score descending
+        result.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return result[:3]  # Keep top 3
+
+    return {
+        "has_learning": True,
+        "query_lessons": dedupe_lessons(
+            local.get("query_lessons", []),
+            remote.get("query_lessons", [])
+        ),
+        "search_lessons": dedupe_lessons(
+            local.get("search_lessons", []),
+            remote.get("search_lessons", [])
+        ),
+        "response_lessons": dedupe_lessons(
+            local.get("response_lessons", []),
+            remote.get("response_lessons", [])
+        ),
+        "similar_queries": (
+            local.get("similar_queries", []) +
+            remote.get("similar_queries", [])
+        )[:5],
+    }

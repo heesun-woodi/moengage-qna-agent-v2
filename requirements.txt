@@ -34,6 +34,9 @@ tenacity>=8.2.0  # Retry logic
 pdfplumber>=0.10.0  # PDF text/image extraction
 Pillow>=10.0.0  # Image processing
 
+# GCP (optional - for Cloud Run deployment)
+google-cloud-storage>=2.10.0
+
 # Development
 pytest>=7.0.0
 pytest-asyncio>=0.21.0

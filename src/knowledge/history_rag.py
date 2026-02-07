@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import tempfile
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -27,6 +28,7 @@ except ImportError:
 
 from config.settings import settings
 from src.utils.logger import logger
+from src.storage import get_storage_backend, StorageBackend
 
 
 @dataclass
@@ -64,11 +66,12 @@ class FAISSHistoryRAG:
     EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
     EMBEDDING_DIM = 384
 
-    def __init__(self, persist_dir: Optional[str] = None):
+    def __init__(self, persist_dir: Optional[str] = None, storage: Optional[StorageBackend] = None):
         """Initialize FAISS History RAG.
 
         Args:
-            persist_dir: Directory to persist data
+            persist_dir: Directory to persist data (for local storage)
+            storage: Storage backend to use (if None, uses configured backend)
         """
         if not FAISS_AVAILABLE:
             raise RuntimeError("FAISS is not available. Install with: pip install faiss-cpu")
@@ -76,11 +79,18 @@ class FAISSHistoryRAG:
         if not SENTENCE_TRANSFORMERS_AVAILABLE:
             raise RuntimeError("sentence-transformers is not available. Install with: pip install sentence-transformers")
 
+        # Use provided storage or get configured backend
+        self.storage = storage or get_storage_backend()
+
+        # Path prefixes for storage
+        self.index_path = "vectordb/faiss.index"
+        self.metadata_path = "vectordb/metadata.json"
+
+        # Legacy paths (for local storage migration)
         self.persist_dir = Path(persist_dir or settings.chroma_persist_dir)
-        self.index_path = self.persist_dir / "faiss.index"
-        self.metadata_path = self.persist_dir / "metadata.json"
-        # Legacy pickle path for migration
+        self._legacy_index_path = self.persist_dir / "faiss.index"
         self._legacy_metadata_path = self.persist_dir / "metadata.pkl"
+        self._legacy_json_path = self.persist_dir / "metadata.json"
 
         # Load embedding model
         logger.info(f"Loading embedding model: {self.EMBEDDING_MODEL}")
@@ -93,37 +103,71 @@ class FAISSHistoryRAG:
 
     def _load_or_create(self):
         """Load existing index or create new one."""
-        if self.index_path.exists() and self.metadata_path.exists():
+        # Try to load from storage backend first
+        if self.storage.exists(self.index_path) and self.storage.exists(self.metadata_path):
             try:
-                self.index = faiss.read_index(str(self.index_path))
-                with open(self.metadata_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    # Reconstruct HistoryEntry objects from dicts
-                    self.entries: Dict[str, HistoryEntry] = {}
-                    for k, v in data.get('entries', {}).items():
-                        if isinstance(v, dict):
-                            self.entries[k] = HistoryEntry(**v)
-                        else:
-                            self.entries[k] = v
-                    self.id_to_idx: Dict[str, int] = data.get('id_to_idx', {})
-                logger.info(f"Loaded existing FAISS index with {self.index.ntotal} vectors")
+                # Load FAISS index from bytes
+                index_bytes = self.storage.read_bytes(self.index_path)
+                if index_bytes:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.index') as tmp:
+                        tmp.write(index_bytes)
+                        tmp.flush()
+                        self.index = faiss.read_index(tmp.name)
+
+                    # Load metadata
+                    data = self.storage.read_json(self.metadata_path)
+                    if data:
+                        self._parse_metadata(data)
+                        logger.info(f"Loaded FAISS index from storage with {self.index.ntotal} vectors")
+                        return
             except Exception as e:
-                logger.error(f"Failed to load existing index: {e}")
-                # Try legacy pickle format for migration
-                if self._try_load_legacy():
-                    logger.info("Migrated from legacy pickle format")
-                    self._save()  # Save in new JSON format
-                else:
-                    self._create_new_index()
-        elif self.index_path.exists() and self._legacy_metadata_path.exists():
-            # Legacy format exists, migrate it
+                logger.error(f"Failed to load from storage backend: {e}")
+
+        # Try legacy local file paths for migration
+        if self._legacy_json_path.exists() and self._legacy_index_path.exists():
+            try:
+                self.index = faiss.read_index(str(self._legacy_index_path))
+                with open(self._legacy_json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self._parse_metadata(data)
+                logger.info(f"Loaded from legacy JSON format, migrating to storage backend...")
+                self._save()  # Migrate to storage backend
+                return
+            except Exception as e:
+                logger.error(f"Failed to load legacy JSON: {e}")
+
+        # Try legacy pickle format
+        if self._legacy_metadata_path.exists() and self._legacy_index_path.exists():
             if self._try_load_legacy():
                 logger.info("Migrated from legacy pickle format")
                 self._save()
+                return
+
+        # Create new index if nothing found
+        self._create_new_index()
+
+    def _parse_metadata(self, data: dict):
+        """Parse metadata dict and reconstruct HistoryEntry objects."""
+        self.entries: Dict[str, HistoryEntry] = {}
+        for k, v in data.get('entries', {}).items():
+            if isinstance(v, dict):
+                # Add default values for new fields if missing
+                v.setdefault('referenced_docs', [])
+                v.setdefault('referenced_history', [])
+                v.setdefault('metadata', {})
+                v.setdefault('source', 'support_history')
+                v.setdefault('source_type', 'customer')
+                self.entries[k] = HistoryEntry(**v)
             else:
-                self._create_new_index()
-        else:
-            self._create_new_index()
+                # Legacy object - add missing attributes
+                if not hasattr(v, 'referenced_docs'):
+                    v.referenced_docs = []
+                if not hasattr(v, 'referenced_history'):
+                    v.referenced_history = []
+                if not hasattr(v, 'metadata'):
+                    v.metadata = {}
+                self.entries[k] = v
+        self.id_to_idx: Dict[str, int] = data.get('id_to_idx', {})
 
     def _try_load_legacy(self) -> bool:
         """Try to load legacy pickle format for migration."""
@@ -133,7 +177,17 @@ class FAISSHistoryRAG:
                 self.index = faiss.read_index(str(self.index_path))
                 with open(self._legacy_metadata_path, 'rb') as f:
                     data = pickle.load(f)
-                    self.entries = data.get('entries', {})
+                    raw_entries = data.get('entries', {})
+                    self.entries = {}
+                    # Add missing attributes to legacy entries
+                    for k, v in raw_entries.items():
+                        if not hasattr(v, 'referenced_docs'):
+                            v.referenced_docs = []
+                        if not hasattr(v, 'referenced_history'):
+                            v.referenced_history = []
+                        if not hasattr(v, 'metadata'):
+                            v.metadata = {}
+                        self.entries[k] = v
                     self.id_to_idx = data.get('id_to_idx', {})
                 return True
         except Exception as e:
@@ -149,23 +203,60 @@ class FAISSHistoryRAG:
         self.persist_dir.mkdir(parents=True, exist_ok=True)
         logger.info("Created new FAISS index")
 
-    def _save(self):
-        """Save index and metadata to disk."""
+    def _entry_to_dict(self, entry: HistoryEntry) -> dict:
+        """Convert HistoryEntry to dict, handling missing attributes."""
+        # Try asdict first for proper dataclass instances
         try:
-            faiss.write_index(self.index, str(self.index_path))
+            return asdict(entry)
+        except Exception:
+            pass
+
+        # Fallback: manually build dict with defaults for missing fields
+        return {
+            'id': getattr(entry, 'id', ''),
+            'title': getattr(entry, 'title', ''),
+            'customer': getattr(entry, 'customer', ''),
+            'category': getattr(entry, 'category', ''),
+            'query_summary': getattr(entry, 'query_summary', ''),
+            'solution': getattr(entry, 'solution', ''),
+            'created_at': getattr(entry, 'created_at', ''),
+            'url': getattr(entry, 'url', ''),
+            'channel_id': getattr(entry, 'channel_id', ''),
+            'channel_name': getattr(entry, 'channel_name', ''),
+            'referenced_docs': getattr(entry, 'referenced_docs', []),
+            'referenced_history': getattr(entry, 'referenced_history', []),
+            'metadata': getattr(entry, 'metadata', {}),
+            'source': getattr(entry, 'source', 'support_history'),
+            'source_type': getattr(entry, 'source_type', 'customer'),
+        }
+
+    def _save(self):
+        """Save index and metadata to storage backend."""
+        try:
+            # Save FAISS index to temp file then upload bytes
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.index') as tmp:
+                faiss.write_index(self.index, tmp.name)
+                tmp.flush()
+                with open(tmp.name, 'rb') as f:
+                    index_bytes = f.read()
+                self.storage.write_bytes(self.index_path, index_bytes)
+
             # Convert HistoryEntry objects to dicts for JSON serialization
             entries_dict = {}
             for k, v in self.entries.items():
-                if hasattr(v, '__dict__'):
-                    entries_dict[k] = asdict(v)
-                else:
+                if isinstance(v, dict):
                     entries_dict[k] = v
-            with open(self.metadata_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'entries': entries_dict,
-                    'id_to_idx': self.id_to_idx
-                }, f, ensure_ascii=False, indent=2)
-            logger.debug("Saved FAISS index and metadata")
+                else:
+                    entries_dict[k] = self._entry_to_dict(v)
+
+            # Save metadata JSON
+            metadata = {
+                'entries': entries_dict,
+                'id_to_idx': self.id_to_idx
+            }
+            self.storage.write_json(self.metadata_path, metadata)
+
+            logger.info(f"Saved FAISS index and metadata to storage ({len(self.entries)} entries)")
         except Exception as e:
             logger.error(f"Failed to save index: {e}")
 

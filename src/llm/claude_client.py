@@ -69,8 +69,9 @@ class ClaudeClient:
             api_key: Anthropic API key (uses settings if not provided)
         """
         self.api_key = api_key or settings.anthropic_api_key
-        self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.async_client = anthropic.AsyncAnthropic(api_key=self.api_key)
+        # Add 60 second timeout to prevent hanging requests
+        self.client = anthropic.Anthropic(api_key=self.api_key, timeout=60.0)
+        self.async_client = anthropic.AsyncAnthropic(api_key=self.api_key, timeout=60.0)
 
     @retry_claude_api
     @claude_circuit

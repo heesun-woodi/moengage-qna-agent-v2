@@ -58,7 +58,8 @@ class QueryOptimizer:
     """LLM-based query optimizer for search."""
 
     def __init__(self):
-        self.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+        # Add 30 second timeout for query optimization
+        self.client = AsyncAnthropic(api_key=settings.anthropic_api_key, timeout=30.0)
 
     @retry_claude_api
     async def optimize_query(self, user_query: str) -> dict:

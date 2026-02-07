@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     # CSM Response Channel - where bot posts answers for CSM review
     csm_response_channel_id: str = Field(default="", env="CSM_RESPONSE_CHANNEL_ID")
 
+    # GCP Configuration (for Cloud Run + Cloud Storage deployment)
+    storage_backend: str = Field(default="local", env="STORAGE_BACKEND")  # "local" or "gcs"
+    gcp_project_id: str = Field(default="", env="GCP_PROJECT_ID")
+    gcp_storage_bucket: str = Field(default="", env="GCP_STORAGE_BUCKET")
+
     def is_csm_channel(self, channel_id: str) -> bool:
         """Check if channel is a CSM internal channel."""
         if not self.csm_channel_ids:
