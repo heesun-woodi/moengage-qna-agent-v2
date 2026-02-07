@@ -983,17 +983,20 @@ async def handle_complete_emoji(
                 logger.warning(f"Failed to extract learning points from thread: {e}")
                 learning_points_dict = {}
 
-        # Create and save LearningEntry if we have learning content
+        # Get responses from messages for learning entry (moved up for iteration check)
+        bot_responses = [m.get("text", "") for m in messages if m.get("bot_id")]
+        user_messages = [m.get("text", "") for m in messages if not m.get("bot_id")]
+
+        # Create and save LearningEntry if we have learning content or CSM feedback
+        iteration_count = session.get("iteration_count", 0) if session else max(0, len(bot_responses) - 1)
         has_learning_content = any([
             learning_points_dict.get("query_lesson"),
             learning_points_dict.get("search_lesson"),
             learning_points_dict.get("response_lesson"),
+            iteration_count >= 1,  # CSM이 최소 1회 피드백을 준 경우
         ])
 
         if has_learning_content:
-            # Get responses from messages for learning entry
-            bot_responses = [m.get("text", "") for m in messages if m.get("bot_id")]
-            user_messages = [m.get("text", "") for m in messages if not m.get("bot_id")]
 
             initial_response = bot_responses[0] if bot_responses else ""
             final_response = bot_responses[-1] if bot_responses else ""
