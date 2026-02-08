@@ -1,6 +1,8 @@
 """Response formatters for Slack messages."""
 
-from typing import List, Optional
+import json
+import re
+from typing import List, Optional, Tuple
 
 from src.knowledge.hybrid_searcher import UnifiedSearchResult
 
@@ -244,3 +246,273 @@ def format_learning_saved_confirmation(
         f"**학습 포인트**\n{lessons_text}\n\n"
         "_이 경험은 향후 유사한 문의에 더 나은 답변을 생성하는 데 활용됩니다._"
     )
+
+
+# =============================================================================
+# Block Kit formatters for CSM responses with delivery button
+# =============================================================================
+
+def _convert_to_slack_mrkdwn(text: str) -> str:
+    """Convert standard markdown bold to Slack mrkdwn format.
+
+    Slack Block Kit uses *bold* instead of **bold**.
+    """
+    return re.sub(r'\*\*(.+?)\*\*', r'*\1*', text)
+
+
+def _split_text_for_blocks(text: str, max_length: int = 2800) -> List[str]:
+    """Split text into chunks that fit within Block Kit section limit (3000 chars).
+
+    Splits at paragraph boundaries, then line boundaries, then hard-cuts.
+    """
+    if len(text) <= max_length:
+        return [text]
+
+    chunks = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= max_length:
+            chunks.append(remaining)
+            break
+
+        # Try to split at paragraph boundary
+        cut_point = remaining[:max_length].rfind("\n\n")
+        if cut_point > max_length // 2:
+            chunks.append(remaining[:cut_point])
+            remaining = remaining[cut_point + 2:]
+            continue
+
+        # Try to split at line boundary
+        cut_point = remaining[:max_length].rfind("\n")
+        if cut_point > max_length // 2:
+            chunks.append(remaining[:cut_point])
+            remaining = remaining[cut_point + 1:]
+            continue
+
+        # Hard cut
+        chunks.append(remaining[:max_length])
+        remaining = remaining[max_length:]
+
+    return chunks
+
+
+def _build_source_text(
+    search_results: Optional[List[UnifiedSearchResult]] = None
+) -> str:
+    """Build source links text from search results for Block Kit."""
+    if not search_results:
+        return ""
+
+    history_sources = []
+    moengage_sources = []
+
+    for result in search_results[:5]:
+        if result.source == "support_history":
+            if result.url:
+                history_sources.append(f"- {result.title}: <{result.url}|슬랙 스레드>")
+            else:
+                history_sources.append(f"- {result.title}")
+        else:
+            moengage_sources.append(f"- <{result.url}|{result.title}>")
+
+    sections = []
+    if history_sources:
+        sections.append("[이전 Q&A]\n" + "\n".join(history_sources))
+    if moengage_sources:
+        sections.append("[MoEngage HelpCenter]\n" + "\n".join(moengage_sources))
+
+    if sections:
+        return "*🔗 참고 자료*\n\n" + "\n\n".join(sections)
+    return ""
+
+
+def _build_deliver_button_block(button_value: str = "") -> List[dict]:
+    """Build the delivery prompt and button blocks."""
+    return [
+        {"type": "divider"},
+        {
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": "이 답변이 충분하시면 아래 버튼을 눌러 고객에게 전달해주세요. 답변을 개선하려면 이 스레드에 피드백을 남겨주세요."
+            }]
+        },
+        {
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "📨 고객에게 전달",
+                    "emoji": True
+                },
+                "style": "primary",
+                "action_id": "deliver_to_customer",
+                "value": button_value
+            }]
+        }
+    ]
+
+
+def build_csm_ticket_blocks(
+    response: str,
+    original_query: str,
+    original_channel: str,
+    original_ts: str,
+    search_results: Optional[List[UnifiedSearchResult]] = None,
+    was_modified: bool = False,
+    channel_name: str = "",
+    button_value: str = ""
+) -> Tuple[List[dict], str]:
+    """Build Block Kit blocks for initial CSM ticket response with delivery button.
+
+    Returns:
+        Tuple of (blocks, fallback_text)
+    """
+    message_link = f"https://slack.com/archives/{original_channel}/p{original_ts.replace('.', '')}"
+    channel_display = f"*#{channel_name}*" if channel_name else ""
+
+    # Header
+    query_preview = original_query[:500] + ('...' if len(original_query) > 500 else '')
+    header_text = (
+        f"📋 *새로운 문의* {channel_display}\n\n"
+        f"*원본 메시지*: <{message_link}|슬랙에서 보기>\n\n"
+        f"*고객 문의 내용*:\n>{query_preview}"
+    )
+
+    blocks: List[dict] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": _convert_to_slack_mrkdwn(header_text)}
+        },
+        {"type": "divider"}
+    ]
+
+    # Response body (split into chunks)
+    response_with_sources = format_support_response(
+        response, search_results, was_modified, current_channel_id=None
+    )
+    response_mrkdwn = _convert_to_slack_mrkdwn(response_with_sources)
+
+    for chunk in _split_text_for_blocks(response_mrkdwn):
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": chunk}
+        })
+
+    # Delivery button
+    blocks.extend(_build_deliver_button_block(button_value))
+
+    # Fallback text
+    fallback = format_csm_ticket_response(
+        response, original_query, original_channel, original_ts,
+        search_results, was_modified, channel_name
+    )
+
+    return blocks, fallback
+
+
+def build_improved_response_blocks(
+    response: str,
+    iteration: int,
+    search_results: Optional[List[UnifiedSearchResult]] = None,
+    button_value: str = ""
+) -> Tuple[List[dict], str]:
+    """Build Block Kit blocks for an improved response with delivery button.
+
+    Returns:
+        Tuple of (blocks, fallback_text)
+    """
+    header_text = f"📝 *개선된 답변 (#{iteration})*"
+
+    blocks: List[dict] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": header_text}
+        }
+    ]
+
+    # Response body (split into chunks)
+    response_with_sources = format_support_response(
+        response, search_results, was_modified=False, current_channel_id=None
+    )
+    response_mrkdwn = _convert_to_slack_mrkdwn(response_with_sources)
+
+    for chunk in _split_text_for_blocks(response_mrkdwn):
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": chunk}
+        })
+
+    # Delivery button
+    blocks.extend(_build_deliver_button_block(button_value))
+
+    # Fallback text
+    fallback = format_improved_response(response, iteration, search_results)
+
+    return blocks, fallback
+
+
+def build_delivered_confirmation_blocks(
+    original_blocks: List[dict],
+    customer_thread_url: str
+) -> List[dict]:
+    """Replace delivery button in blocks with a delivery confirmation.
+
+    Removes the actions block and delivery prompt, adds confirmation.
+    """
+    confirmed_blocks = []
+
+    for block in original_blocks:
+        # Skip the actions block and the delivery prompt context block
+        if block.get("type") == "actions":
+            continue
+        if block.get("type") == "context":
+            elements = block.get("elements", [])
+            if elements and "고객에게 전달" in elements[0].get("text", ""):
+                continue
+        confirmed_blocks.append(block)
+
+    # Remove trailing divider if present (from the button section)
+    if confirmed_blocks and confirmed_blocks[-1].get("type") == "divider":
+        confirmed_blocks.pop()
+
+    # Add confirmation
+    confirmed_blocks.append({"type": "divider"})
+    confirmed_blocks.append({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": f"✅ *전달 완료* | <{customer_thread_url}|고객 스레드에서 보기>"
+        }
+    })
+
+    return confirmed_blocks
+
+
+def format_customer_response(
+    response: str,
+    search_results: Optional[List[UnifiedSearchResult]] = None,
+    current_channel_id: Optional[str] = None
+) -> str:
+    """Format response for delivery to customer thread.
+
+    Strips CSM-specific headers and formatting. Returns answer + source links.
+    """
+    return format_support_response(
+        response,
+        search_results,
+        was_modified=False,
+        current_channel_id=current_channel_id or ""
+    )
+
+
+def update_button_value(blocks: List[dict], new_value: str) -> List[dict]:
+    """Update the value of the deliver_to_customer button in blocks."""
+    for block in blocks:
+        if block.get("type") == "actions":
+            for element in block.get("elements", []):
+                if element.get("action_id") == "deliver_to_customer":
+                    element["value"] = new_value
+    return blocks

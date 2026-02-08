@@ -13,6 +13,7 @@ class MessageState(Enum):
     IDLE = "idle"               # No emoji, not processing
     PROCESSING = "processing"   # Ticket emoji detected, generating response
     ANSWERED = "answered"       # Bot has replied, waiting for resolution
+    DELIVERED = "delivered"     # Response delivered to customer thread
     ARCHIVING = "archiving"     # Complete emoji detected, archiving in progress
     COMPLETED = "completed"     # Archived to history
 
@@ -181,7 +182,7 @@ async def can_process_complete(channel: str, message_ts: str) -> bool:
 
     # Can process complete if ANSWERED (normal flow)
     # or IDLE (if ticket was processed before state tracking started)
-    if current_state in [MessageState.ANSWERED, MessageState.IDLE]:
+    if current_state in [MessageState.ANSWERED, MessageState.DELIVERED, MessageState.IDLE]:
         return True
 
     logger.info(
@@ -197,14 +198,22 @@ async def can_process_complete(channel: str, message_ts: str) -> bool:
 #  │   IDLE   │ ───────────────>│ PROCESSING │ ─────────────────>│ ANSWERED │
 #  └──────────┘                 └────────────┘                   └──────────┘
 #       ▲                             │                               │
-#       │                             │ error                         │ complete emoji
-#       │                             ▼                               ▼
+#       │                             │ error                   deliver button
+#       │                             ▼                               │
 #       │                        ┌──────────┐                   ┌───────────┐
-#       └────────────────────────│   IDLE   │                   │ ARCHIVING │
+#       └────────────────────────│   IDLE   │                   │ DELIVERED │
 #         emoji removed          └──────────┘                   └───────────┘
 #                                                                     │
-#                                                                     │ archived
-#                                                                     ▼
+#                                                               complete emoji
+#                                                                     │
+#                                                               ┌───────────┐
+#                                                               │ ARCHIVING │
+#                                                               └───────────┘
+#                                                                     │
+#                                                                  archived
+#                                                                     │
 #                                                               ┌───────────┐
 #                                                               │ COMPLETED │
 #                                                               └───────────┘
+#
+# Note: complete emoji can also be applied directly from ANSWERED state

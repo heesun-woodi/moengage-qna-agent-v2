@@ -1,5 +1,6 @@
 """Slack event handlers for emoji reactions and app mentions."""
 
+import json
 import re
 import asyncio
 import time
@@ -22,7 +23,12 @@ from src.bot.formatters import (
     format_error_response,
     format_csm_ticket_response,
     format_improved_response,
-    format_learning_saved_confirmation
+    format_learning_saved_confirmation,
+    build_csm_ticket_blocks,
+    build_improved_response_blocks,
+    build_delivered_confirmation_blocks,
+    format_customer_response,
+    update_button_value,
 )
 from src.knowledge.hybrid_searcher import search_and_format, hybrid_search, format_context_for_llm
 from src.knowledge.history_updater import (
@@ -237,6 +243,11 @@ def register_handlers(app: AsyncApp):
         # Non-CSM channel mention without PDF - ignore
         logger.debug("Non-CSM channel mention without PDF, ignoring")
 
+    @app.action("deliver_to_customer")
+    async def on_deliver_to_customer(ack, body, client):
+        """Handle deliver to customer button click."""
+        await handle_deliver_to_customer(ack, body, client)
+
 
 async def handle_ticket_emoji(
     client: AsyncWebClient,
@@ -401,21 +412,23 @@ async def handle_ticket_emoji(
             context, response, strict=False
         )
 
-        # Format the response for CSM channel (includes original query link)
-        formatted_response = format_csm_ticket_response(
-            final_response,
-            user_query,
-            channel,
-            message_ts,
-            search_results,
-            was_modified,
-            channel_name=channel_name
+        # Build Block Kit response with delivery button for CSM channel
+        blocks, fallback_text = build_csm_ticket_blocks(
+            response=final_response,
+            original_query=user_query,
+            original_channel=channel,
+            original_ts=message_ts,
+            search_results=search_results,
+            was_modified=was_modified,
+            channel_name=channel_name,
+            button_value=""  # Placeholder - updated after posting
         )
 
         # Post response to CSM channel as a new message (not thread)
         post_result = await client.chat_postMessage(
             channel=csm_response_channel,
-            text=formatted_response
+            text=fallback_text,
+            blocks=blocks
         )
 
         # Validate post result
@@ -430,6 +443,19 @@ async def handle_ticket_emoji(
             logger.error("No timestamp returned from chat_postMessage")
             await set_message_state(channel, message_ts, MessageState.IDLE)
             return
+
+        # Update button value with actual message ts
+        button_value = json.dumps({"csm_thread_ts": csm_thread_ts})
+        updated_blocks = update_button_value(blocks, button_value)
+        try:
+            await client.chat_update(
+                channel=csm_response_channel,
+                ts=csm_thread_ts,
+                text=fallback_text,
+                blocks=updated_blocks
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update button value: {e}")
 
         # Store session data for CSM conversation
         async with _session_lock:
@@ -451,6 +477,8 @@ async def handle_ticket_emoji(
                 "created_at": datetime.now().isoformat(),
                 "created_at_ts": time.time(),  # For TTL cleanup
                 "query_analysis": query_analysis,
+                "response_messages": {csm_thread_ts: final_response},
+                "delivered_responses": set(),
             }
 
         # Periodic cleanup of stale sessions
@@ -724,11 +752,41 @@ async def handle_csm_thread_reply(
 
         # Handle different intents
         if intent == "approval":
-            # CSM approves the response - no need to generate new response
+            # CSM approves - provide deliver button for the latest response
+            last_response_ts = None
+            response_messages = session.get("response_messages", {})
+            if response_messages:
+                last_response_ts = list(response_messages.keys())[-1]
+
+            button_value = json.dumps({"csm_thread_ts": thread_ts})
+            approval_blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "✓ 확인했습니다! 아래 버튼으로 고객에게 전달하거나, 원본 메시지에 :완료: 이모지를 추가하여 히스토리에 저장해주세요."
+                    }
+                },
+                {
+                    "type": "actions",
+                    "elements": [{
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "📨 고객에게 전달",
+                            "emoji": True
+                        },
+                        "style": "primary",
+                        "action_id": "deliver_to_customer",
+                        "value": button_value
+                    }]
+                }
+            ]
             await client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
-                text="✓ 확인했습니다. 원본 메시지에 ✅ 이모지를 추가하시면 히스토리에 저장됩니다."
+                text="✓ 확인했습니다. 아래 버튼으로 고객에게 전달해주세요.",
+                blocks=approval_blocks
             )
             return
 
@@ -772,19 +830,42 @@ async def handle_csm_thread_reply(
         async with _session_lock:
             session["improved_responses"].append(improved_response)
 
-        # Format and post the improved response
+        # Build Block Kit response with delivery button
         iteration = session["iteration_count"]
-        formatted_response = format_improved_response(
-            improved_response,
-            iteration,
-            search_results=None  # Already included in the response
+        blocks, fallback_text = build_improved_response_blocks(
+            response=improved_response,
+            iteration=iteration,
+            search_results=None,  # Already included in the response
+            button_value=""  # Placeholder - updated after posting
         )
 
-        await client.chat_postMessage(
+        post_result = await client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
-            text=formatted_response
+            text=fallback_text,
+            blocks=blocks
         )
+
+        # Update button value with actual message ts
+        response_msg_ts = post_result.get("ts", "")
+        if response_msg_ts:
+            button_value = json.dumps({"csm_thread_ts": thread_ts})
+            updated_blocks = update_button_value(blocks, button_value)
+            try:
+                await client.chat_update(
+                    channel=channel,
+                    ts=response_msg_ts,
+                    text=fallback_text,
+                    blocks=updated_blocks
+                )
+            except Exception as e:
+                logger.warning(f"Failed to update button value: {e}")
+
+            # Track response in session
+            async with _session_lock:
+                if "response_messages" not in session:
+                    session["response_messages"] = {}
+                session["response_messages"][response_msg_ts] = improved_response
 
         logger.info(f"[CSM REPLY] Posted improved response #{iteration}")
 
@@ -795,6 +876,126 @@ async def handle_csm_thread_reply(
             channel=channel,
             thread_ts=thread_ts,
             text=f"⚠️ 개선된 답변 생성 중 오류가 발생했습니다: {str(e)[:100]}"
+        )
+
+
+async def handle_deliver_to_customer(ack, body, client):
+    """Handle 'deliver_to_customer' button click.
+
+    Delivers the bot's response to the original customer thread.
+    """
+    await ack()
+
+    message = body.get("message", {})
+    msg_ts = message.get("ts", "")
+    csm_thread_ts = message.get("thread_ts") or msg_ts
+    original_blocks = message.get("blocks", [])
+    csm_channel = body.get("channel", {}).get("id", "")
+    user_id = body.get("user", {}).get("id", "")
+
+    # Look up session
+    session = _csm_sessions.get(csm_thread_ts)
+
+    if not session:
+        await client.chat_postEphemeral(
+            channel=csm_channel,
+            user=user_id,
+            text="⚠️ 세션이 만료되었습니다. 답변을 복사하여 직접 전달해주세요."
+        )
+        return
+
+    # Check for double-delivery
+    delivered = session.get("delivered_responses", set())
+    if msg_ts in delivered:
+        await client.chat_postEphemeral(
+            channel=csm_channel,
+            user=user_id,
+            text="이미 전달된 답변입니다."
+        )
+        return
+
+    # Get the response text to deliver
+    response_messages = session.get("response_messages", {})
+    response_text = response_messages.get(msg_ts, "")
+
+    if not response_text:
+        # Fallback: use the latest available response
+        if session.get("improved_responses"):
+            response_text = session["improved_responses"][-1]
+        else:
+            response_text = session.get("initial_response", "")
+
+    if not response_text:
+        await client.chat_postEphemeral(
+            channel=csm_channel,
+            user=user_id,
+            text="⚠️ 전달할 답변 내용을 찾을 수 없습니다."
+        )
+        return
+
+    original_channel = session.get("original_channel", "")
+    original_ts = session.get("original_ts", "")
+
+    if not original_channel or not original_ts:
+        await client.chat_postEphemeral(
+            channel=csm_channel,
+            user=user_id,
+            text="⚠️ 원본 메시지 정보를 찾을 수 없습니다."
+        )
+        return
+
+    try:
+        # Format for customer (answer + source links)
+        search_results = session.get("search_results", [])
+        customer_response = format_customer_response(
+            response_text, search_results, current_channel_id=original_channel
+        )
+
+        # Post to customer thread
+        customer_post = await client.chat_postMessage(
+            channel=original_channel,
+            thread_ts=original_ts,
+            text=customer_response
+        )
+
+        # Build customer thread URL for confirmation
+        customer_msg_ts = customer_post.get("ts", "")
+        customer_thread_url = (
+            f"https://slack.com/archives/{original_channel}"
+            f"/p{customer_msg_ts.replace('.', '')}"
+        )
+
+        # Update CSM message: remove button, add confirmation
+        confirmed_blocks = build_delivered_confirmation_blocks(
+            original_blocks, customer_thread_url
+        )
+        await client.chat_update(
+            channel=csm_channel,
+            ts=msg_ts,
+            text=f"✅ 전달 완료 | {customer_thread_url}",
+            blocks=confirmed_blocks
+        )
+
+        # Mark as delivered in session
+        async with _session_lock:
+            if "delivered_responses" not in session:
+                session["delivered_responses"] = set()
+            session["delivered_responses"].add(msg_ts)
+
+        # Update state machine
+        await set_message_state(original_channel, original_ts, MessageState.DELIVERED)
+
+        logger.info(
+            f"[DELIVER] Response delivered to {original_channel}/{original_ts} "
+            f"from CSM thread {csm_thread_ts}"
+        )
+
+    except Exception as e:
+        logger.error(f"Error delivering response: {e}", exc_info=True)
+        await client.chat_postEphemeral(
+            channel=csm_channel,
+            user=user_id,
+            text=f"⚠️ 전달 중 오류가 발생했습니다: {str(e)[:100]}"
         )
 
 
