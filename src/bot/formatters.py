@@ -346,11 +346,11 @@ def _build_deliver_button_block(button_value: str = "") -> List[dict]:
     return [
         {"type": "divider"},
         {
-            "type": "context",
-            "elements": [{
+            "type": "section",
+            "text": {
                 "type": "mrkdwn",
-                "text": "이 답변이 충분하시면 아래 버튼을 눌러 고객에게 전달해주세요. 답변을 개선하려면 이 스레드에 피드백을 남겨주세요."
-            }]
+                "text": "이 답변이 충분하시면 아래 버튼을 눌러 고객에게 전달해주세요.\n답변을 개선하려면 이 스레드에 @moengage qna 를 태그해서 피드백을 남겨주세요."
+            }
         },
         {
             "type": "actions",
@@ -367,7 +367,8 @@ def build_csm_ticket_blocks(
     search_results: Optional[List[UnifiedSearchResult]] = None,
     was_modified: bool = False,
     channel_name: str = "",
-    button_value: str = ""
+    button_value: str = "",
+    ticket_user: str = ""
 ) -> Tuple[List[dict], str]:
     """Build Block Kit blocks for initial CSM ticket response with delivery button.
 
@@ -377,6 +378,15 @@ def build_csm_ticket_blocks(
     message_link = f"https://slack.com/archives/{original_channel}/p{original_ts.replace('.', '')}"
     channel_display = f"*#{channel_name}*" if channel_name else ""
 
+    blocks: List[dict] = []
+
+    # Ticket user notification
+    if ticket_user:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"<@{ticket_user}> 님 답변이 작성되었습니다"}
+        })
+
     # Header
     query_preview = original_query[:500] + ('...' if len(original_query) > 500 else '')
     header_text = (
@@ -385,13 +395,11 @@ def build_csm_ticket_blocks(
         f"*고객 문의 내용*:\n>{query_preview}"
     )
 
-    blocks: List[dict] = [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": _convert_to_slack_mrkdwn(header_text)}
-        },
-        {"type": "divider"}
-    ]
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": _convert_to_slack_mrkdwn(header_text)}
+    })
+    blocks.append({"type": "divider"})
 
     # Response body (split into chunks)
     response_with_sources = format_support_response(
@@ -421,14 +429,18 @@ def build_improved_response_blocks(
     response: str,
     iteration: int,
     search_results: Optional[List[UnifiedSearchResult]] = None,
-    button_value: str = ""
+    button_value: str = "",
+    ticket_user: str = ""
 ) -> Tuple[List[dict], str]:
     """Build Block Kit blocks for an improved response with delivery button.
 
     Returns:
         Tuple of (blocks, fallback_text)
     """
-    header_text = f"📝 *개선된 답변 (#{iteration})*"
+    if ticket_user:
+        header_text = f"<@{ticket_user}> 📝 *개선된 답변 (#{iteration})*"
+    else:
+        header_text = f"📝 *개선된 답변 (#{iteration})*"
 
     blocks: List[dict] = [
         {
@@ -472,9 +484,9 @@ def build_delivered_confirmation_blocks(
         # Skip the actions block and the delivery prompt context block
         if block.get("type") == "actions":
             continue
-        if block.get("type") == "context":
-            elements = block.get("elements", [])
-            if elements and "고객에게 전달" in elements[0].get("text", ""):
+        if block.get("type") == "section":
+            text_obj = block.get("text", {})
+            if "고객에게 전달" in text_obj.get("text", "") and "태그해서" in text_obj.get("text", ""):
                 continue
         confirmed_blocks.append(block)
 
@@ -502,14 +514,32 @@ def format_customer_response(
 ) -> str:
     """Format response for delivery to customer thread.
 
-    Strips CSM-specific headers and formatting. Returns answer + source links.
+    Strips CSM-specific headers (e.g. 문제 파악 section), adds greeting,
+    and returns answer + source links.
     """
-    return format_support_response(
+    formatted = format_support_response(
         response,
         search_results,
         was_modified=False,
         current_channel_id=current_channel_id or ""
     )
+
+    # Remove "문제 파악" section (from start of section header to next ** header)
+    formatted = re.sub(
+        r'\*\*🔍\s*문제 파악\*\*\s*\n.*?(?=\*\*[^\*])',
+        '',
+        formatted,
+        flags=re.DOTALL
+    )
+    formatted = formatted.strip()
+
+    # Add greeting at the top
+    greeting = (
+        "안녕하세요. 문의하신 사항에 대해 답변드립니다.\n"
+        "답변내용을 확인하시고 문의사항이 해소가 되지 않으신다면 추가 문의 해주시길 부탁드립니다.\n\n"
+    )
+
+    return greeting + formatted
 
 
 def update_button_value(blocks: List[dict], new_value: str) -> List[dict]:

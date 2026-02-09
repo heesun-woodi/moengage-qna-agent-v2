@@ -421,7 +421,8 @@ async def handle_ticket_emoji(
             search_results=search_results,
             was_modified=was_modified,
             channel_name=channel_name,
-            button_value=""  # Placeholder - updated after posting
+            button_value="",  # Placeholder - updated after posting
+            ticket_user=user
         )
 
         # Post response to CSM channel as a new message (not thread)
@@ -468,6 +469,7 @@ async def handle_ticket_emoji(
                 "original_ts": message_ts,
                 "original_query": user_query,
                 "channel_name": channel_name,
+                "ticket_user": user,
                 "context": context,
                 "search_results": search_results,
                 "initial_response": final_response,
@@ -843,7 +845,8 @@ async def handle_csm_thread_reply(
             response=improved_response,
             iteration=iteration,
             search_results=None,  # Already included in the response
-            button_value=""  # Placeholder - updated after posting
+            button_value="",  # Placeholder - updated after posting
+            ticket_user=session.get("ticket_user", "")
         )
 
         # Try with Block Kit first, fall back to plain text if blocks fail
@@ -1067,16 +1070,20 @@ async def handle_complete_emoji(
         # Check if this is the CSM response channel with an active session
         is_csm_response_channel = channel == settings.csm_response_channel_id
         session = None
+        csm_thread_ts = None  # Preserve for completion notification
 
         if is_csm_response_channel:
             # Direct lookup by CSM thread ts
             session = _csm_sessions.get(message_ts)
+            if session:
+                csm_thread_ts = message_ts
         else:
             # Search for session by original_channel + original_ts
             # (when ✅ is added on the original customer message)
             for csm_ts, s in _csm_sessions.items():
                 if s.get("original_channel") == channel and s.get("original_ts") == message_ts:
                     session = s
+                    csm_thread_ts = csm_ts
                     logger.info(f"Found CSM session via original message: csm_thread={csm_ts}")
                     break
 
@@ -1289,10 +1296,40 @@ async def handle_complete_emoji(
         else:
             logger.info("No learning content extracted from conversation")
 
-        # Update state (no confirmation message sent to keep thread clean)
+        # Update state
         if entry_id:
             await set_message_state(channel, message_ts, MessageState.COMPLETED)
             logger.info(f"Archived thread to history: {entry_id}, learning: {learning_entry_id}")
+
+            # Send completion notification to CSM channel thread
+            if csm_thread_ts and settings.csm_response_channel_id:
+                try:
+                    summary_parts = [
+                        "✅ *history와 학습내용이 저장되었습니다.*\n",
+                        f"*저장 요약*",
+                        f"- 히스토리 ID: `{entry_id[:8]}...`",
+                    ]
+                    if learning_entry_id:
+                        summary_parts.append(f"- 학습 ID: `{learning_entry_id[:8]}...`")
+                    summary_parts.append(f"- 피드백 횟수: {iteration_count}회")
+
+                    if learning_points_dict:
+                        summary_parts.append("- 학습 포인트:")
+                        if learning_points_dict.get("query_lesson"):
+                            summary_parts.append(f"  • 문의 해석: {learning_points_dict['query_lesson'][:80]}")
+                        if learning_points_dict.get("search_lesson"):
+                            summary_parts.append(f"  • 검색 전략: {learning_points_dict['search_lesson'][:80]}")
+                        if learning_points_dict.get("response_lesson"):
+                            summary_parts.append(f"  • 답변 작성: {learning_points_dict['response_lesson'][:80]}")
+
+                    await client.chat_postMessage(
+                        channel=settings.csm_response_channel_id,
+                        thread_ts=csm_thread_ts,
+                        text="\n".join(summary_parts)
+                    )
+                    logger.info(f"Posted completion summary to CSM thread {csm_thread_ts}")
+                except Exception as notify_err:
+                    logger.warning(f"Failed to post completion notification: {notify_err}")
         else:
             logger.warning(f"Failed to archive thread {channel}/{message_ts}")
             await set_message_state(channel, message_ts, MessageState.ANSWERED)
