@@ -17,17 +17,10 @@ except ImportError:
     FAISS_AVAILABLE = False
     faiss = None
 
-# Try to import sentence-transformers
-try:
-    from sentence_transformers import SentenceTransformer
-    SENTENCE_TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
-    SentenceTransformer = None
-
 from config.settings import settings
 from src.utils.logger import logger
 from src.storage import get_storage_backend, StorageBackend
+from src.knowledge.embedder import get_embedder, SENTENCE_TRANSFORMERS_AVAILABLE
 from src.knowledge.history_updater import (
     LearningEntry,
     LearningPoints,
@@ -76,9 +69,8 @@ class LearningStore:
         self._legacy_metadata_path = self.persist_dir / "learning_metadata.pkl"
         self._legacy_json_path = self.persist_dir / "learning_metadata.json"
 
-        # Load embedding model (reuse from history_rag if possible)
-        logger.info(f"Loading embedding model for learning store: {self.EMBEDDING_MODEL}")
-        self.embedder = SentenceTransformer(self.EMBEDDING_MODEL)
+        # Load embedding model (shared instance)
+        self.embedder = get_embedder()
 
         # Load or create index
         self._load_or_create()
@@ -444,7 +436,7 @@ class InMemoryLearningStore:
 
     def _get_embedder(self):
         if self._embedder is None and SENTENCE_TRANSFORMERS_AVAILABLE:
-            self._embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+            self._embedder = get_embedder()
         return self._embedder
 
     def _generate_id(self, content: str) -> str:

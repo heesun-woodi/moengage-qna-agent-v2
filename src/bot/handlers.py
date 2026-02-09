@@ -425,18 +425,21 @@ async def handle_ticket_emoji(
         )
 
         # Post response to CSM channel as a new message (not thread)
-        post_result = await client.chat_postMessage(
-            channel=csm_response_channel,
-            text=fallback_text,
-            blocks=blocks
-        )
-
-        # Validate post result
-        if not post_result.get("ok", True):  # Slack SDK may not include 'ok' on success
-            error_msg = post_result.get("error", "Unknown error")
-            logger.error(f"Failed to post to CSM channel: {error_msg}")
-            await set_message_state(channel, message_ts, MessageState.IDLE)
-            return
+        # Try with Block Kit first, fall back to plain text if blocks fail
+        try:
+            post_result = await client.chat_postMessage(
+                channel=csm_response_channel,
+                text=fallback_text,
+                blocks=blocks
+            )
+        except Exception as block_err:
+            logger.warning(f"Block Kit posting failed, falling back to plain text: {block_err}")
+            post_result = await client.chat_postMessage(
+                channel=csm_response_channel,
+                text=fallback_text
+            )
+            # Clear blocks so we don't try to update them later
+            blocks = None
 
         csm_thread_ts = post_result.get("ts", "")
         if not csm_thread_ts:
@@ -444,18 +447,19 @@ async def handle_ticket_emoji(
             await set_message_state(channel, message_ts, MessageState.IDLE)
             return
 
-        # Update button value with actual message ts
-        button_value = json.dumps({"csm_thread_ts": csm_thread_ts})
-        updated_blocks = update_button_value(blocks, button_value)
-        try:
-            await client.chat_update(
-                channel=csm_response_channel,
-                ts=csm_thread_ts,
-                text=fallback_text,
-                blocks=updated_blocks
-            )
-        except Exception as e:
-            logger.warning(f"Failed to update button value: {e}")
+        # Update button value with actual message ts (skip if blocks failed)
+        if blocks:
+            button_value = json.dumps({"csm_thread_ts": csm_thread_ts})
+            updated_blocks = update_button_value(blocks, button_value)
+            try:
+                await client.chat_update(
+                    channel=csm_response_channel,
+                    ts=csm_thread_ts,
+                    text=fallback_text,
+                    blocks=updated_blocks
+                )
+            except Exception as e:
+                logger.warning(f"Failed to update button value: {e}")
 
         # Store session data for CSM conversation
         async with _session_lock:
@@ -514,6 +518,9 @@ async def handle_ticket_emoji(
 
     except Exception as e:
         logger.error(f"Error processing ticket: {e}", exc_info=True)
+        # Log Slack API error details if available
+        if hasattr(e, 'response'):
+            logger.error(f"Slack API error response: {getattr(e.response, 'data', 'N/A')}")
 
         # Post error message to CSM channel
         error_response = format_error_response(str(e))
@@ -839,16 +846,26 @@ async def handle_csm_thread_reply(
             button_value=""  # Placeholder - updated after posting
         )
 
-        post_result = await client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=fallback_text,
-            blocks=blocks
-        )
+        # Try with Block Kit first, fall back to plain text if blocks fail
+        try:
+            post_result = await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=fallback_text,
+                blocks=blocks
+            )
+        except Exception as block_err:
+            logger.warning(f"Block Kit posting failed for improved response, falling back to plain text: {block_err}")
+            post_result = await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=fallback_text
+            )
+            blocks = None
 
-        # Update button value with actual message ts
+        # Update button value with actual message ts (skip if blocks failed)
         response_msg_ts = post_result.get("ts", "")
-        if response_msg_ts:
+        if response_msg_ts and blocks:
             button_value = json.dumps({"csm_thread_ts": thread_ts})
             updated_blocks = update_button_value(blocks, button_value)
             try:
@@ -1049,7 +1066,19 @@ async def handle_complete_emoji(
     try:
         # Check if this is the CSM response channel with an active session
         is_csm_response_channel = channel == settings.csm_response_channel_id
-        session = _csm_sessions.get(message_ts) if is_csm_response_channel else None
+        session = None
+
+        if is_csm_response_channel:
+            # Direct lookup by CSM thread ts
+            session = _csm_sessions.get(message_ts)
+        else:
+            # Search for session by original_channel + original_ts
+            # (when ✅ is added on the original customer message)
+            for csm_ts, s in _csm_sessions.items():
+                if s.get("original_channel") == channel and s.get("original_ts") == message_ts:
+                    session = s
+                    logger.info(f"Found CSM session via original message: csm_thread={csm_ts}")
+                    break
 
         # Check if this is a CSM channel (for legacy support)
         is_csm = settings.is_csm_channel(channel) or is_csm_response_channel

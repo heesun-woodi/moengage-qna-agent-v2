@@ -70,7 +70,7 @@ def format_error_response(error_message: str) -> str:
         "⚠️ **일시적인 오류가 발생했습니다.**\n\n"
         "잠시 후 다시 티켓 이모지(🎫)를 추가해 주세요.\n"
         "문제가 지속되면 MoEngage 대시보드를 통해 서포트 티켓을 생성해 주세요.\n\n"
-        f"_오류 내용: {error_message[:100]}_"
+        f"_오류 내용: {error_message[:300]}_"
     )
 
 
@@ -329,6 +329,20 @@ def _build_source_text(
 
 def _build_deliver_button_block(button_value: str = "") -> List[dict]:
     """Build the delivery prompt and button blocks."""
+    button = {
+        "type": "button",
+        "text": {
+            "type": "plain_text",
+            "text": "📨 고객에게 전달",
+            "emoji": True
+        },
+        "style": "primary",
+        "action_id": "deliver_to_customer",
+    }
+    # Slack requires value to be non-empty if present
+    if button_value:
+        button["value"] = button_value
+
     return [
         {"type": "divider"},
         {
@@ -340,17 +354,7 @@ def _build_deliver_button_block(button_value: str = "") -> List[dict]:
         },
         {
             "type": "actions",
-            "elements": [{
-                "type": "button",
-                "text": {
-                    "type": "plain_text",
-                    "text": "📨 고객에게 전달",
-                    "emoji": True
-                },
-                "style": "primary",
-                "action_id": "deliver_to_customer",
-                "value": button_value
-            }]
+            "elements": [button]
         }
     ]
 

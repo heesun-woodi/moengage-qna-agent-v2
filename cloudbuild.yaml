@@ -45,6 +45,7 @@ steps:
       - '1'
       - '--max-instances'
       - '3'
+      - '--no-cpu-throttling'
       - '--set-env-vars'
       - 'STORAGE_BACKEND=gcs,GCP_STORAGE_BUCKET=${_GCS_BUCKET},HISTORY_API_ENABLED=true,PYTHONUNBUFFERED=1,COMPLETE_EMOJI=완료'
       - '--update-secrets'
