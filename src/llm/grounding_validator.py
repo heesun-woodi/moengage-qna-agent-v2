@@ -4,7 +4,7 @@ from typing import Dict, Any, List, Tuple
 import json
 
 from src.llm.claude_client import get_claude_client
-from src.llm.prompts import GROUNDING_VALIDATION_PROMPT, get_grounding_validation_prompt
+from src.llm.prompts import get_grounding_validation_system_prompt, get_grounding_validation_prompt
 from src.utils.logger import logger
 
 
@@ -30,7 +30,7 @@ async def validate_grounding(
         response = await client.async_client.messages.create(
             model=client.DEFAULT_MODEL,
             max_tokens=1024,
-            system=GROUNDING_VALIDATION_PROMPT,
+            system=get_grounding_validation_system_prompt(),
             messages=[
                 {"role": "user", "content": prompt}
             ]

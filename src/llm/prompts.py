@@ -1,4 +1,25 @@
-"""System prompts for Claude API."""
+"""System prompts for Claude API.
+
+Prompts are loaded from skill MD files via SkillStore (GCS/local).
+The constants below serve as embedded defaults for first-run initialization.
+Use get_*_system_prompt() functions to get the live (potentially upgraded) versions.
+"""
+
+
+def _get_skill(key: str, fallback: str) -> str:
+    """Get skill from SkillStore, fallback to embedded default."""
+    try:
+        from src.knowledge.skill_store import get_skill_store
+        store = get_skill_store()
+        skill = store.get_skill(key)
+        if skill:
+            return skill
+    except Exception:
+        pass
+    return fallback
+
+
+# --- Embedded defaults (used for first-run initialization) ---
 
 # Main support bot system prompt
 SUPPORT_BOT_SYSTEM_PROMPT = """당신은 MoEngage 솔루션 전문 테크니컬 서포트 봇입니다.
@@ -19,7 +40,7 @@ SUPPORT_BOT_SYSTEM_PROMPT = """당신은 MoEngage 솔루션 전문 테크니컬 
 **🔍 문제 파악**
 (사용자 질문 또는 이슈의 핵심 요약)
 
-**✅ 해결 가이드**
+**:완료: 해결 가이드**
 (구체적인 해결 방법 또는 단계별 설정 가이드)
 - 단계 1: ...
 - 단계 2: ...
@@ -338,52 +359,251 @@ def get_learning_extraction_prompt(
 
 
 # CSM reply analysis system prompt for understanding CSM intent
-CSM_REPLY_ANALYSIS_SYSTEM_PROMPT = """당신은 CSM의 피드백을 분석하는 전문가입니다.
+# (Updated for resource-list based flow)
+CSM_AGENT_SYSTEM_PROMPT = """당신은 MoEngage 솔루션 전문 CSM 지원 에이전트입니다.
 
-## 역할
-CSM이 봇 답변에 대해 남긴 피드백을 분석하여 의도를 파악합니다.
+## 배경
+봇은 고객 문의에 대해 관련 자료(MoEngage 문서, Slack 스레드, Notion 페이지, 지원 히스토리) 목록을 검색하여 제공합니다.
+CSM은 이 스레드에서 봇에게 자유롭게 요청을 남깁니다.
 
-## 피드백 유형
-1. **추가 검색 요청**: "SDK 버전도 찾아봐", "카카오 관련 문서도 검색해줘"
-2. **맥락 정보 제공**: "이 고객사는 A 상황이야", "실제로는 B를 묻는 거야"
-3. **답변 보완 요청**: "여기에 주의사항도 추가해줘", "더 구체적으로 설명해줘"
-4. **오류 지적**: "이 부분이 틀렸어", "메뉴 경로가 다르던데"
-5. **승인/완료**: "좋아", "이대로 보내면 될 듯", "완료"
+## 당신의 역할
+CSM의 자연어 메시지를 이해하고, 아래 3가지 action 중 가장 적절한 것을 선택하여 실행합니다.
 
-## 출력 형식 (JSON)
+## Action 유형
+
+### 1. search — 추가 자료 검색
+CSM이 새로운 키워드나 주제로 자료를 더 찾아달라고 요청할 때.
+예: "SDK 관련 자료도 찾아줘", "카카오 문서 더 찾아봐", "인앱 메시지 관련 검색해줘"
+
+### 2. respond — 고객 답변 작성
+CSM이 검색된 자료를 바탕으로 고객에게 보낼 답변을 작성해달라고 요청할 때.
+예: "위 자료로 답변 써줘", "고객 답변 작성해줘", "이걸 바탕으로 답변해줘"
+
+### 3. answer — CSM 질문에 직접 답변
+CSM이 검색 결과에 대해 질문하거나, 세션 맥락에 대한 정보를 요청할 때.
+세션에 있는 검색 결과, 대화 이력 등의 맥락 정보를 활용하여 직접 답변합니다.
+예: "노션 문서 5건이 뭐야?", "검색 결과 요약해줘", "어떤 자료를 찾았어?", "이 중에서 가장 관련있는 건?"
+
+## 출력 형식 (반드시 유효한 JSON만 출력)
 ```json
 {
-  "intent": "additional_search | context_info | enhance_response | correction | approval | other",
-  "keywords": ["추가 검색 키워드 (있는 경우)"],
-  "context": "제공된 맥락 정보 요약 (있는 경우)",
-  "instruction": "CSM의 구체적인 요청 요약"
+  "action": "search | respond | answer",
+  "keywords": ["검색 키워드1", "키워드2"],
+  "instruction": "CSM 요청 요약",
+  "message": "answer action일 때 CSM에게 전달할 답변"
 }
 ```
 
-## 규칙
-- 하나의 메시지에 여러 의도가 있을 수 있음
-- 가장 주된 의도를 intent로 설정
+## 필드 규칙
+- **search**: `keywords` 필수 (검색할 키워드 목록), `message`는 빈 문자열
+- **respond**: `instruction` 필수 (답변 작성 시 참고할 CSM 지시사항), `message`는 빈 문자열
+- **answer**: `message` 필수 (CSM에게 직접 전달할 답변 내용, 한국어), `keywords`는 빈 배열
+- answer의 `message`는 제공된 세션 맥락에 기반하여 작성. 맥락에 없는 내용은 만들지 마세요.
 - 반드시 유효한 JSON만 출력"""
 
 
-def get_csm_reply_analysis_prompt(csm_message: str, conversation_context: str = "") -> str:
-    """Generate prompt for CSM reply analysis.
+# System prompt for writing customer response based on selected resources
+WRITE_RESPONSE_SYSTEM_PROMPT = """당신은 MoEngage 솔루션 전문 테크니컬 서포트 봇입니다.
+
+## 역할
+CSM이 선택한 자료들을 기반으로 고객 문의에 맞춘 정확한 답변을 작성합니다.
+단일 문서에 정답이 없어도 여러 문서를 조합하여 결론을 도출할 수 있습니다.
+
+## 핵심 규칙
+1. **제공된 자료 기반**: 주어진 컨텍스트(Context)에만 기반하여 답변하세요. 없는 내용을 만들지 마세요.
+2. **한국어 답변**: 모든 답변은 한국어로 작성하되, 메뉴명이나 전문 용어는 영어 원문을 병기합니다.
+3. **출처 명시**: 답변 하단에 참고한 문서의 제목과 URL을 포함합니다.
+4. **다층 근거 활용**: 직접 근거 문서뿐 아니라 보완 설명 문서, 운영 가이드 문서도 함께 활용하여 실무적으로 완성된 답변을 작성하세요.
+
+## 답변 전 자체 검증 (반드시 수행)
+답변 작성 전 내부적으로 다음을 확인하세요:
+1. **단위 구분**: 상태/속성 문의 시 어떤 레벨의 데이터인지 구분
+   - user-level vs device-level
+   - API 응답 필드 vs 사용자 속성(User Attribute) vs 대시보드 지표
+   - 예: push permission(사용자 설정) ≠ reachability(디바이스 도달 가능성)
+2. **필드명/속성명 정확성**: 컨텍스트에 나오는 필드명만 사용
+   - 컨텍스트에서 확인 안 된 필드명/속성명 절대 사용 금지
+   - 빠진 관련 필드가 없는지 확인
+   - 필드의 의미를 잘못 일반화하지 않았는지 확인
+3. **개념 구분**: 유사하지만 다른 개념 혼동 금지
+   - 원시 상태(raw permission/status) vs 파생 지표(derived reachability/metric)
+   - 설정값 vs 실시간 상태 vs 집계 결과
+
+## 번호가 있는 질문 처리
+고객 문의에 번호가 매겨진 하위 질문이 있으면:
+- **반드시** 동일한 번호 체계로 각 질문에 개별 답변
+- 각 답변 구조: **결론** → 근거 (어떤 문서에서 확인) → 부연 설명
+- 답변할 수 없는 항목도 해당 번호에 "확인 필요" 명시 (건너뛰지 말 것)
+
+## 정보 부재 시 답변 구조
+모든 정보를 찾을 수 없을 때 "찾을 수 없습니다"로 끝내지 마세요. 3단계로 구분:
+
+**✅ 확인된 사항**
+(컨텍스트에서 확인 가능한 내용)
+
+**⚠️ 추가 확인 필요**
+(부분적 정보만 있거나 불확실한 영역 - 근거가 약한 부분 명시)
+
+**📋 추가로 필요한 자료**
+(답변 완성을 위해 더 필요한 문서/정보 유형)
+
+## 기본 답변 형식
+```
+**✅ 해결 가이드**
+(구체적인 해결 방법 또는 단계별 설정 가이드)
+
+**🔗 참고 자료**
+- 문서 제목: URL
+```
+
+## 주의사항
+- 기능, 메뉴 경로, 설정을 만들어내지 마세요.
+- 불확실한 경우 "확인이 필요합니다"라고 명시하세요.
+- 고객에게 직접 전달될 답변이므로 친절하고 명확하게 작성하세요.
+"""
+
+
+# Re-ranking system prompt for filtering and scoring search results
+RERANK_SYSTEM_PROMPT = """당신은 검색 결과의 관련성을 평가하는 전문가입니다.
+
+## 역할
+고객 문의와 검색 결과들을 비교하여 관련성을 점수로 평가하고, 각 결과의 근거 유형을 분류합니다.
+
+## 평가 기준
+- **8-10**: 문의와 직접 관련된 해결책 또는 동일한 이슈를 다룸
+- **5-7**: 관련 있지만 부분적으로만 도움이 됨
+- **3-4**: 간접적 관련 (같은 기능이지만 다른 이슈)
+- **0-2**: 관련 없음
+
+## 근거 유형 (evidence_type)
+각 결과가 문의 답변에 어떤 역할을 하는지 분류:
+- **direct**: 질문에 직접 답하는 문서 (해당 API/기능의 공식 설명)
+- **supplementary**: 보완 설명 문서 (대체 조회 경로, 관련 개념, 연관 기능)
+- **best_practice**: 운영/권장 가이드 (권장 방식, 아키텍처 가이드, 실무 팁)
+
+## 출력 형식 (JSON 배열만 출력)
+```json
+[
+  {"index": 1, "relevance": 8, "summary": "이 문의와 관련된 내용 요약 1-2줄", "evidence_type": "direct"},
+  {"index": 2, "relevance": 6, "summary": "대체 조회 방법 설명", "evidence_type": "supplementary"},
+  {"index": 3, "relevance": 2, "summary": "", "evidence_type": ""},
+  ...
+]
+```
+
+## 규칙
+- 모든 결과에 대해 평가 (빠뜨리지 말 것)
+- summary는 관련성 5점 이상인 결과에만 작성 (5점 미만은 빈 문자열)
+- evidence_type은 관련성 5점 이상인 결과에만 분류 (5점 미만은 빈 문자열)
+- summary는 **반드시 한국어**로 작성 (영어 문서라도 한국어로 요약)
+- summary는 다음 2가지를 포함 (1-2줄):
+  1. **연관성**: 이 자료가 고객 문의에 왜 관련되는지 (어떤 질문에 답하는 근거인지)
+  2. **핵심 내용**: 이 자료에서 답변에 활용할 수 있는 핵심 정보가 무엇인지
+- 예시: "Push API 응답 필드 목록이 포함되어 있어 1번 질문(응답 포함 여부)에 직접 답변 가능. campaign_id, message_id 등 필드 구조 확인 가능"
+- 단순 제목 반복이나 "관련 문서입니다" 같은 모호한 설명 금지
+- 반드시 유효한 JSON 배열만 출력"""
+
+
+def get_rerank_prompt(query: str, results_text: str) -> str:
+    """Generate prompt for re-ranking search results.
 
     Args:
-        csm_message: CSM's feedback message
-        conversation_context: Previous conversation for context
+        query: Original customer query
+        results_text: Formatted search results for evaluation
 
     Returns:
         Complete prompt string
     """
-    context_section = ""
-    if conversation_context:
-        context_section = f"""## 이전 대화 맥락
-{conversation_context}
+    return f"""## 고객 문의
+{query}
 
-"""
+## 검색 결과
+{results_text}
 
-    return f"""{context_section}## CSM 메시지
+위 검색 결과들의 관련성을 평가해주세요. JSON 배열로 출력하세요."""
+
+
+def get_write_response_prompt(
+    context: str,
+    original_query: str,
+    csm_instruction: str = "",
+    sub_questions: list = None
+) -> str:
+    """Generate prompt for writing a customer response based on selected resources.
+
+    Args:
+        context: Retrieved documents as context
+        original_query: Original customer question
+        csm_instruction: Optional CSM guidance on what to focus on
+        sub_questions: Optional list of decomposed sub-questions from query analysis
+
+    Returns:
+        Complete prompt string
+    """
+    instruction_section = ""
+    if csm_instruction:
+        instruction_section = f"\n## CSM 가이드\n{csm_instruction}\n"
+
+    sub_q_section = ""
+    if sub_questions and len(sub_questions) > 1:
+        sub_q_section = "\n## 식별된 하위 질문 (각 질문에 반드시 개별 답변할 것)\n"
+        for i, sq in enumerate(sub_questions, 1):
+            q_text = sq.get("question", "") if isinstance(sq, dict) else str(sq)
+            sub_q_section += f"{i}. {q_text}\n"
+
+    return f"""## 컨텍스트 (참고 자료)
+{context}
+{instruction_section}{sub_q_section}
+## 고객 문의
+{original_query}
+
+위 자료를 기반으로 고객 문의에 대한 답변을 작성해주세요. 자료에 없는 내용은 만들지 마세요."""
+
+
+def get_csm_agent_prompt(csm_message: str, session_context: str) -> str:
+    """Generate prompt for CSM agent to process a natural language request.
+
+    Args:
+        csm_message: CSM's message in the thread
+        session_context: Rich session context including search results, feedback history
+
+    Returns:
+        Complete prompt string
+    """
+    return f"""## 세션 맥락
+{session_context}
+
+## CSM 메시지
 {csm_message}
 
-위 메시지의 의도를 분석해주세요. JSON 형식으로 출력하세요."""
+위 세션 맥락을 참고하여 CSM의 요청을 처리해주세요. JSON 형식으로 출력하세요."""
+
+
+# --- Skill-backed getters (load from GCS, fallback to embedded defaults) ---
+
+def get_support_bot_system_prompt() -> str:
+    return _get_skill("support_bot", SUPPORT_BOT_SYSTEM_PROMPT)
+
+def get_csm_conversational_system_prompt() -> str:
+    return _get_skill("csm_conversational", CSM_CONVERSATIONAL_PROMPT)
+
+def get_thread_analyzer_system_prompt() -> str:
+    return _get_skill("thread_analyzer", THREAD_ANALYZER_SYSTEM_PROMPT)
+
+def get_grounding_validation_system_prompt() -> str:
+    return _get_skill("grounding_validation", GROUNDING_VALIDATION_PROMPT)
+
+def get_pdf_parser_system_prompt() -> str:
+    return _get_skill("pdf_parser", PDF_PARSER_SYSTEM_PROMPT)
+
+def get_learning_extraction_system_prompt() -> str:
+    return _get_skill("learning_extraction", LEARNING_EXTRACTION_SYSTEM_PROMPT)
+
+def get_csm_agent_system_prompt() -> str:
+    return _get_skill("csm_agent", CSM_AGENT_SYSTEM_PROMPT)
+
+def get_write_response_system_prompt() -> str:
+    return _get_skill("write_response", WRITE_RESPONSE_SYSTEM_PROMPT)
+
+def get_rerank_system_prompt() -> str:
+    return _get_skill("rerank", RERANK_SYSTEM_PROMPT)

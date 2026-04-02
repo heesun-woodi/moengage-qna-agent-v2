@@ -395,6 +395,111 @@ async def add_learning_entry(request: web.Request) -> web.Response:
         return web.json_response({"error": "Internal server error"}, status=500)
 
 
+async def run_retrospective(request: web.Request) -> web.Response:
+    """Run daily retrospective: analyze recent learnings and upgrade skills.
+
+    Triggered by Cloud Scheduler or manual POST.
+    """
+    if not verify_api_key(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    try:
+        learning_store = get_learning_store()
+        recent_entries = learning_store.get_recent_entries(hours=24)
+
+        if not recent_entries:
+            logger.info("[RETROSPECTIVE] No recent learning entries, skipping")
+            return web.json_response({"status": "skip", "reason": "no recent learnings"})
+
+        # Format learning entries for Claude
+        entries_text_parts = []
+        entry_ids = []
+        for entry in recent_entries:
+            lp = entry.learning_points
+            parts = []
+            if hasattr(lp, 'query_lesson') and lp.query_lesson:
+                parts.append(f"  문의 해석: {lp.query_lesson}")
+            if hasattr(lp, 'search_lesson') and lp.search_lesson:
+                parts.append(f"  검색 전략: {lp.search_lesson}")
+            if hasattr(lp, 'response_lesson') and lp.response_lesson:
+                parts.append(f"  답변 작성: {lp.response_lesson}")
+            if parts:
+                entries_text_parts.append(
+                    f"- 원본 문의: {entry.original_query[:100]}\n" + "\n".join(parts)
+                )
+                entry_ids.append(entry.id)
+
+        if not entries_text_parts:
+            return web.json_response({"status": "skip", "reason": "no actionable learnings"})
+
+        entries_text = "\n\n".join(entries_text_parts)
+
+        # Load current skill contents for dedup
+        from src.knowledge.skill_store import get_skill_store
+        skill_store = get_skill_store()
+        current_skills = {
+            "write_response": skill_store.get_skill("write_response")[:500],
+            "query_optimizer": skill_store.get_skill("query_optimizer")[:500],
+            "rerank": skill_store.get_skill("rerank")[:500],
+        }
+
+        # Run retrospective with Claude
+        import anthropic
+        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key, timeout=60.0)
+        retro_prompt = skill_store.get_skill("retrospective")
+
+        prompt = f"""## 최근 24시간 학습 데이터 ({len(recent_entries)}건)
+{entries_text}
+
+## 현재 스킬 요약 (중복 방지용)
+write_response: {current_skills['write_response']}...
+query_optimizer: {current_skills['query_optimizer']}...
+rerank: {current_skills['rerank']}...
+
+위 학습 데이터를 분석하여 스킬 업그레이드 사항을 JSON으로 출력하세요."""
+
+        response = await client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            system=retro_prompt,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        response_text = response.content[0].text if response.content else "{}"
+
+        # Parse response
+        from src.llm.claude_client import extract_json_safely
+        result = extract_json_safely(response_text)
+
+        if not isinstance(result, dict) or "upgrades" not in result:
+            logger.warning(f"[RETROSPECTIVE] Invalid response format")
+            return web.json_response({"status": "error", "reason": "invalid response"})
+
+        # Apply upgrades to skill files
+        upgrades = result.get("upgrades", {})
+        applied = []
+        today = datetime.now().strftime("%Y-%m-%d")
+        for skill_key, upgrade_text in upgrades.items():
+            if upgrade_text and upgrade_text.strip():
+                section = f"## 회고 기반 추가 지침 ({today})\n{upgrade_text.strip()}"
+                skill_store.append_to_skill(skill_key, section)
+                applied.append(skill_key)
+                logger.info(f"[RETROSPECTIVE] Upgraded skill: {skill_key}")
+
+        summary = result.get("summary", "")
+        logger.info(f"[RETROSPECTIVE] Complete. Upgraded {len(applied)} skills: {applied}. Summary: {summary}")
+
+        return web.json_response({
+            "status": "ok",
+            "entries_analyzed": len(recent_entries),
+            "skills_upgraded": applied,
+            "summary": summary,
+        })
+
+    except Exception as e:
+        logger.error(f"[RETROSPECTIVE] Failed: {e}", exc_info=True)
+        return web.json_response({"error": str(e)}, status=500)
+
+
 def create_api_app() -> web.Application:
     """Create aiohttp web application for API.
 
@@ -415,6 +520,9 @@ def create_api_app() -> web.Application:
     app.router.add_get("/api/learning/stats", get_learning_stats)
     app.router.add_get("/api/learning/export", export_learning_entries)
     app.router.add_post("/api/learning", add_learning_entry)
+
+    # Retrospective route
+    app.router.add_post("/api/retrospective", run_retrospective)
 
     logger.info("History & Learning API routes registered")
     return app

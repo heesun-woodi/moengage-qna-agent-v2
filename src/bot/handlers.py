@@ -25,12 +25,13 @@ from src.bot.formatters import (
     format_improved_response,
     format_learning_saved_confirmation,
     build_csm_ticket_blocks,
+    build_csm_resource_list_blocks,
     build_improved_response_blocks,
     build_delivered_confirmation_blocks,
     format_customer_response,
     update_button_value,
 )
-from src.knowledge.hybrid_searcher import search_and_format, hybrid_search, format_context_for_llm
+from src.knowledge.hybrid_searcher import search_and_format, hybrid_search, multi_query_hybrid_search, format_context_for_llm, rerank_results
 from src.knowledge.history_updater import (
     add_from_slack_thread,
     LearningEntry,
@@ -43,15 +44,13 @@ from src.knowledge.history_updater import (
 from src.knowledge.feedback_store import get_feedback_store
 from src.knowledge.learning_store import get_learning_store, save_learning_entry, get_learning_for_query
 from src.llm.claude_client import (
-    generate_response,
     generate_csm_response,
     extract_learning_points,
     extract_learning_from_thread,
-    analyze_csm_reply,
-    generate_improved_response
+    generate_improved_response,
+    get_claude_client
 )
 from src.llm.thread_analyzer import analyze_slack_thread, detect_resolution_keywords
-from src.llm.grounding_validator import validate_and_filter_response
 from src.llm.query_optimizer import analyze_query
 from src.utils.logger import logger
 from src.bot.history_command import handle_history_command
@@ -63,6 +62,184 @@ _session_lock = asyncio.Lock()
 
 # Session TTL in seconds (24 hours)
 SESSION_TTL_SECONDS = 86400
+
+
+def _parse_bot_message(message: dict) -> tuple:
+    """Extract original_query, original_channel, original_ts from bot's resource list message.
+
+    Returns:
+        (original_query, original_channel, original_ts) tuple
+    """
+    import re
+    text = message.get("text", "")
+    blocks = message.get("blocks", [])
+
+    original_query = ""
+    original_channel = ""
+    original_ts = ""
+
+    # Try blocks first, then fallback text
+    search_text = ""
+    for block in blocks:
+        block_text = block.get("text", {}).get("text", "") if isinstance(block.get("text"), dict) else ""
+        search_text += block_text + "\n"
+    if not search_text.strip():
+        search_text = text
+
+    # Extract channel + ts from message link
+    link_match = re.search(r'https://[^/]+/archives/([A-Z0-9]+)/p(\d+)', search_text)
+    if link_match:
+        original_channel = link_match.group(1)
+        raw_ts = link_match.group(2)
+        if len(raw_ts) > 10:
+            original_ts = raw_ts[:10] + "." + raw_ts[10:]
+        else:
+            original_ts = raw_ts
+
+    # Extract query from blockquote (after "고객 문의 내용" or "고객 문의", with optional mrkdwn bold *)
+    query_match = re.search(r'\*?(?:고객 문의 내용|고객 문의)\*?[:\s]*\n?>(.*?)(?:\n[^>]|\Z)', search_text, re.DOTALL)
+    if query_match:
+        original_query = query_match.group(1).strip()
+    elif '고객 문의:' in search_text:
+        fallback_match = re.search(r'고객 문의:\s*(.+)', search_text)
+        if fallback_match:
+            original_query = fallback_match.group(1).strip()[:500]
+
+    return original_query, original_channel, original_ts
+
+
+async def _auto_extract_learning(session: dict, thread_ts: str):
+    """Background task: extract and save learning from current session state."""
+    try:
+        improved = session.get("improved_responses", [])
+        if not improved:
+            return
+
+        learning_points = await extract_learning_points(
+            original_query=session.get("original_query", ""),
+            initial_response=session.get("initial_response", ""),
+            csm_feedback=session.get("feedback", []),
+            improved_responses=improved,
+            final_response=improved[-1]
+        )
+
+        has_learning = any(
+            learning_points.get(k)
+            for k in ["query_lesson", "search_lesson", "response_lesson"]
+        )
+        if not has_learning:
+            logger.info("[AUTO-LEARN] No learning points extracted")
+            return
+
+        from src.knowledge.history_updater import LearningEntry, LearningPoints
+        entry = LearningEntry(
+            original_query=session.get("original_query", ""),
+            original_channel=session.get("original_channel", ""),
+            original_ts=session.get("original_ts", ""),
+            learning_points=LearningPoints(
+                query_lesson=learning_points.get("query_lesson", ""),
+                search_lesson=learning_points.get("search_lesson", ""),
+                response_lesson=learning_points.get("response_lesson", ""),
+            ),
+            category=learning_points.get("category", "기타"),
+            iteration_count=session.get("iteration_count", 0),
+            created_at=session.get("created_at", datetime.now().isoformat()),
+            completed_at=datetime.now().isoformat(),
+        )
+        entry_id = await save_learning_entry(entry)
+        session["auto_learned_at"] = time.time()
+        logger.info(f"[AUTO-LEARN] Saved entry {entry_id} from session {thread_ts}")
+    except Exception as e:
+        logger.warning(f"[AUTO-LEARN] Failed: {e}")
+
+
+async def _reconstruct_session(client, channel: str, thread_ts: str) -> Optional[dict]:
+    """Reconstruct session from Slack thread history.
+
+    Fetches the bot's root message in the thread, parses the original query
+    and customer message info, re-runs search, and creates a new session.
+    """
+    try:
+        thread_result = await client.conversations_replies(
+            channel=channel, ts=thread_ts, limit=1
+        )
+        messages = thread_result.get("messages", [])
+        if not messages:
+            logger.warning(f"[SESSION RESTORE] No messages found in thread {thread_ts}")
+            return None
+
+        root_msg = messages[0]
+        original_query, original_channel, original_ts = _parse_bot_message(root_msg)
+        if not original_query:
+            logger.warning(f"[SESSION RESTORE] Could not parse original query from thread {thread_ts}")
+            return None
+
+        logger.info(f"[SESSION RESTORE] Parsed query: {original_query[:80]}")
+
+        # Analyze query for sub-questions and optimized search
+        query_analysis = None
+        try:
+            query_analysis = await analyze_query(original_query)
+        except Exception as e:
+            logger.warning(f"[SESSION RESTORE] Query analysis failed: {e}")
+
+        # Re-run search (multi-query if sub-questions detected)
+        sub_questions = query_analysis.get("sub_questions", []) if query_analysis else []
+        if len(sub_questions) > 1:
+            search_results = await multi_query_hybrid_search(query_analysis)
+        else:
+            search_results = await hybrid_search(original_query, query_analysis=query_analysis)
+
+        all_results = list(search_results)
+        try:
+            search_results = await rerank_results(original_query, search_results)
+        except Exception as e:
+            logger.warning(f"[SESSION RESTORE] Rerank failed: {e}")
+
+        context = format_context_for_llm(search_results, current_channel_id=None)
+
+        # Retrieve learning from past similar cases
+        learning_data = None
+        learning_context = ""
+        try:
+            learning_data = await get_learning_for_query(original_query, top_k=3)
+            if learning_data and learning_data.get("has_learning"):
+                learning_context = _format_learning_context(learning_data)
+                context = f"{context}\n\n{learning_context}"
+                logger.info(f"[SESSION RESTORE] Injected learning from similar cases")
+        except Exception as e:
+            logger.warning(f"[SESSION RESTORE] Learning retrieval failed: {e}")
+
+        session = {
+            "original_channel": original_channel,
+            "original_ts": original_ts,
+            "original_query": original_query,
+            "context": context,
+            "search_results": search_results,
+            "all_search_results": all_results,
+            "initial_response": "",
+            "iteration_count": 0,
+            "feedback": [],
+            "improved_responses": [],
+            "search_queries": [original_query],
+            "search_results_titles": [r.title for r in search_results],
+            "referenced_docs": [r.url for r in search_results if r.source == "moengage_docs"],
+            "referenced_history": [],
+            "created_at": datetime.now().isoformat(),
+            "created_at_ts": time.time(),
+            "query_analysis": query_analysis,
+            "learning_data": learning_data,
+            "learning_context": learning_context,
+            "response_messages": {},
+            "delivered_responses": set(),
+        }
+        async with _session_lock:
+            _csm_sessions[thread_ts] = session
+        logger.info(f"[SESSION RESTORE] Reconstructed for thread {thread_ts}")
+        return session
+    except Exception as e:
+        logger.error(f"[SESSION RESTORE] Failed: {e}", exc_info=True)
+        return None
 
 
 async def cleanup_stale_sessions():
@@ -123,8 +300,8 @@ def register_handlers(app: AsyncApp):
 
         logger.info(f"Reaction added: {reaction} on {channel}/{message_ts} by {user}")
 
-        # Handle ticket emoji
-        if reaction == settings.ticket_emoji:
+        # Handle ticket emoji (support both custom :ticket: and standard :admission_tickets:)
+        if reaction in (settings.ticket_emoji, "admission_tickets"):
             await handle_ticket_emoji(client, channel, message_ts, user)
 
         # Handle complete emoji
@@ -185,19 +362,28 @@ def register_handlers(app: AsyncApp):
         if subtype:
             return
 
+        # Skip messages that contain bot mentions — app_mention event handles those
+        import re as _re
+        if text and _re.search(r'<@[A-Z0-9]+>', text):
+            return
+
         # Check if this is a reply in the CSM response channel
         if channel == settings.csm_response_channel_id:
-            # Check if the thread has an active session
-            if thread_ts in _csm_sessions:
-                logger.info(f"[CSM THREAD REPLY] Processing reply in thread {thread_ts}")
-                await handle_csm_thread_reply(
-                    client=client,
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    message_ts=message_ts,
-                    text=text,
-                    user=user
-                )
+            # Try to find or reconstruct session
+            if thread_ts not in _csm_sessions:
+                session = await _reconstruct_session(client, channel, thread_ts)
+                if not session:
+                    return  # Not a bot thread or parse failed → ignore
+
+            logger.info(f"[CSM THREAD REPLY] Processing reply in thread {thread_ts}")
+            await handle_csm_thread_reply(
+                client=client,
+                channel=channel,
+                thread_ts=thread_ts,
+                message_ts=message_ts,
+                text=text,
+                user=user
+            )
 
     @app.event("app_mention")
     async def handle_app_mention(event: Dict[str, Any], client: AsyncWebClient):
@@ -233,6 +419,31 @@ def register_handlers(app: AsyncApp):
         if pdf_files:
             # Process PDF files for history import
             await handle_pdf_import(client, channel, message_ts, pdf_files)
+            return
+
+        # Check if this is a thread reply in CSM response channel
+        thread_ts = event.get("thread_ts")
+        if channel == settings.csm_response_channel_id and thread_ts:
+            # Try to find or reconstruct session
+            if thread_ts not in _csm_sessions:
+                session = await _reconstruct_session(client, channel, thread_ts)
+                if not session:
+                    await client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text="⚠️ 원본 문의를 찾을 수 없습니다. 원본 문의 내용을 알려주시면 복원해드리겠습니다."
+                    )
+                    return
+
+            logger.info(f"[APP_MENTION] Routing to CSM thread reply handler for {thread_ts}")
+            await handle_csm_thread_reply(
+                client=client,
+                channel=channel,
+                thread_ts=thread_ts,
+                message_ts=message_ts,
+                text=text,
+                user=user
+            )
             return
 
         # Check if this is a CSM channel - handle conversational Q&A
@@ -307,6 +518,52 @@ async def handle_ticket_emoji(
             return
 
         message = result["messages"][0]
+
+        # Detect thread reply vs parent message with thread
+        if message.get("ts") != message_ts:
+            # Case 1: 댓글에 이모지 → 해당 댓글만 사용
+            parent_ts = message.get("ts")
+            logger.info(f"Emoji on thread reply, fetching from thread {parent_ts}")
+            try:
+                thread_result = await client.conversations_replies(
+                    channel=channel,
+                    ts=parent_ts
+                )
+                for reply in thread_result.get("messages", []):
+                    if reply.get("ts") == message_ts:
+                        message = reply
+                        logger.info(f"Found thread reply: {message.get('text', '')[:80]}")
+                        break
+            except Exception as e:
+                logger.warning(f"Could not fetch thread reply: {e}")
+        elif message.get("reply_count", 0) > 0:
+            # Case 2: 부모 메시지에 이모지 + 댓글 있음 → 스레드 전체 수집
+            logger.info(f"Emoji on parent message with {message.get('reply_count')} replies, collecting thread")
+            try:
+                thread_result = await client.conversations_replies(
+                    channel=channel,
+                    ts=message_ts
+                )
+                thread_messages = thread_result.get("messages", [])
+                # Filter out noise: bot messages, short messages (<15 chars), system-like messages
+                meaningful_texts = []
+                for m in thread_messages:
+                    if m.get("bot_id"):  # Skip bot messages
+                        continue
+                    text = m.get("text", "").strip()
+                    if not text or len(text) < 15:  # Skip empty or very short (e.g. "감사합니다!")
+                        continue
+                    # Skip ticket system messages
+                    if text in ("티켓 전송 완료", "티켓 접수 완료!", "티켓 접수 완료"):
+                        continue
+                    meaningful_texts.append(text)
+                if meaningful_texts:
+                    message["text"] = "\n\n".join(meaningful_texts)
+                    logger.info(f"Collected {len(meaningful_texts)} meaningful messages from thread (filtered {len(thread_messages) - len(meaningful_texts)} noise)")
+            except Exception as e:
+                logger.warning(f"Could not fetch thread replies: {e}")
+        # Case 3: 일반 메시지 (스레드 없음) → 기존 동작
+
         user_query = message.get("text", "")
         attachments = message.get("attachments", [])
         files = message.get("files", [])
@@ -348,36 +605,59 @@ async def handle_ticket_emoji(
         except Exception as e:
             logger.warning(f"Query analysis failed: {e}")
 
-        # Search for relevant documents (with pre-analyzed query)
-        search_results = await hybrid_search(
-            user_query,
-            use_llm_optimization=False  # Already optimized above
-        )
+        # Search for relevant documents
+        # Use multi-query search when query has multiple sub-questions
+        sub_questions = query_analysis.get("sub_questions", []) if query_analysis else []
+        if len(sub_questions) > 1:
+            logger.info(f"[MULTI-QUERY] {len(sub_questions)} sub-questions detected")
+            for i, sq in enumerate(sub_questions, 1):
+                logger.info(f"  [{i}] {sq.get('question', '')[:60]} → '{sq.get('search_query', '')}'")
+            search_results = await multi_query_hybrid_search(
+                query_analysis,
+                moengage_top_k=5,
+                history_top_k=3,
+            )
+        else:
+            search_results = await hybrid_search(
+                optimized_query,
+                use_llm_optimization=False,
+                query_analysis=query_analysis
+            )
 
-        # Also search with optimized query if different
-        if optimized_query != user_query:
-            from src.knowledge.moengage_api import search_moengage
-            try:
-                optimized_results = await search_moengage(optimized_query)
-                # Merge results (avoid duplicates)
-                existing_urls = {r.url for r in search_results}
-                for r in optimized_results:
-                    if r.url not in existing_urls:
-                        from src.knowledge.hybrid_searcher import UnifiedSearchResult
-                        search_results.append(UnifiedSearchResult(
-                            title=r.title,
-                            url=r.url,
-                            content=r.content,
-                            snippet=r.snippet,
-                            source="moengage_docs",
-                            score=0.85
-                        ))
-            except Exception as e:
-                logger.warning(f"Optimized search failed: {e}")
+        # Track pre-rerank counts per source
+        from src.knowledge.hybrid_searcher import group_results_by_source
+        pre_rerank_by_source = {s: len(items) for s, items in group_results_by_source(search_results).items()}
+        logger.info(f"[PRE-RERANK] By source: {pre_rerank_by_source}")
+
+        # Save all results before reranking (so agent can reference filtered-out docs)
+        all_search_results_before_rerank = list(search_results)
+
+        # Re-rank results using Claude for relevance
+        try:
+            search_results = await rerank_results(user_query, search_results)
+        except Exception as e:
+            logger.warning(f"[RERANK] Failed, using original results: {e}")
+
+        post_rerank_by_source = {s: len(items) for s, items in group_results_by_source(search_results).items()}
+        logger.info(f"[POST-RERANK] By source: {post_rerank_by_source}")
 
         # Format context for LLM (CSM gets full access)
         from src.knowledge.hybrid_searcher import format_context_for_llm
         context = format_context_for_llm(search_results, current_channel_id=None)
+
+        # Retrieve learning from past similar cases
+        learning_data = None
+        learning_context = ""
+        try:
+            learning_data = await get_learning_for_query(user_query, top_k=3)
+            if learning_data and learning_data.get("has_learning"):
+                learning_context = _format_learning_context(learning_data)
+                context = f"{context}\n\n{learning_context}"
+                logger.info(f"[LEARNING] Injected learning from {len(learning_data.get('similar_queries', []))} similar cases")
+            else:
+                logger.info("[LEARNING] No similar learning found")
+        except Exception as e:
+            logger.warning(f"[LEARNING] Retrieval failed: {e}")
 
         # Count results by source
         moengage_count = sum(1 for r in search_results if r.source == "moengage_docs")
@@ -391,42 +671,19 @@ async def handle_ticket_emoji(
         referenced_docs = [r.url for r in search_results if r.source == "moengage_docs"]
         referenced_history = [r.url for r in search_results if r.source == "support_history"]
 
-        # Inject learning data from similar past cases
-        try:
-            learning_data = await get_learning_for_query(user_query, top_k=3)
-            if learning_data.get("has_learning"):
-                learning_context = _format_learning_context(learning_data)
-                context = f"{context}\n\n{learning_context}"
-                similar_count = len(learning_data.get("similar_queries", []))
-                logger.info(f"[LEARNING] Added learning context from {similar_count} similar cases")
-            else:
-                logger.info("[LEARNING] No similar learning data found")
-        except Exception as e:
-            logger.warning(f"[LEARNING] Failed to get learning data: {e}")
-
-        # Generate response with Claude (use enhanced query with URL/image context)
-        response = await generate_response(context, enhanced_query if analyzed_content else user_query)
-
-        # Validate grounding
-        final_response, was_modified = await validate_and_filter_response(
-            context, response, strict=False
-        )
-
-        # Build Block Kit response with delivery button for CSM channel
-        blocks, fallback_text = build_csm_ticket_blocks(
-            response=final_response,
+        # Build resource list Block Kit for CSM channel (no answer generation)
+        blocks, fallback_text = build_csm_resource_list_blocks(
+            search_results=search_results,
             original_query=user_query,
             original_channel=channel,
             original_ts=message_ts,
-            search_results=search_results,
-            was_modified=was_modified,
             channel_name=channel_name,
-            button_value="",  # Placeholder - updated after posting
-            ticket_user=user
+            ticket_user=user,
+            pre_rerank_by_source=pre_rerank_by_source,
+            post_rerank_by_source=post_rerank_by_source
         )
 
-        # Post response to CSM channel as a new message (not thread)
-        # Try with Block Kit first, fall back to plain text if blocks fail
+        # Post resource list to CSM channel as a new message (not thread)
         try:
             post_result = await client.chat_postMessage(
                 channel=csm_response_channel,
@@ -439,7 +696,6 @@ async def handle_ticket_emoji(
                 channel=csm_response_channel,
                 text=fallback_text
             )
-            # Clear blocks so we don't try to update them later
             blocks = None
 
         csm_thread_ts = post_result.get("ts", "")
@@ -447,20 +703,6 @@ async def handle_ticket_emoji(
             logger.error("No timestamp returned from chat_postMessage")
             await set_message_state(channel, message_ts, MessageState.IDLE)
             return
-
-        # Update button value with actual message ts (skip if blocks failed)
-        if blocks:
-            button_value = json.dumps({"csm_thread_ts": csm_thread_ts})
-            updated_blocks = update_button_value(blocks, button_value)
-            try:
-                await client.chat_update(
-                    channel=csm_response_channel,
-                    ts=csm_thread_ts,
-                    text=fallback_text,
-                    blocks=updated_blocks
-                )
-            except Exception as e:
-                logger.warning(f"Failed to update button value: {e}")
 
         # Store session data for CSM conversation
         async with _session_lock:
@@ -472,7 +714,8 @@ async def handle_ticket_emoji(
                 "ticket_user": user,
                 "context": context,
                 "search_results": search_results,
-                "initial_response": final_response,
+                "all_search_results": all_search_results_before_rerank,  # Includes filtered-out results
+                "initial_response": "",  # No initial response - resource list only
                 "iteration_count": 0,
                 "feedback": [],
                 "improved_responses": [],
@@ -483,7 +726,9 @@ async def handle_ticket_emoji(
                 "created_at": datetime.now().isoformat(),
                 "created_at_ts": time.time(),  # For TTL cleanup
                 "query_analysis": query_analysis,
-                "response_messages": {csm_thread_ts: final_response},
+                "learning_data": learning_data,
+                "learning_context": learning_context,
+                "response_messages": {},  # No initial response message
                 "delivered_responses": set(),
             }
 
@@ -500,7 +745,7 @@ async def handle_ticket_emoji(
             search_results_count=len(search_results),
             moengage_results_count=moengage_count,
             history_results_count=history_count,
-            response_length=len(final_response),
+            response_length=0,
             metadata={
                 "original_channel": channel,
                 "original_message_ts": message_ts,
@@ -690,6 +935,12 @@ def _format_learning_context(learning_data: dict) -> str:
     """
     sections = ["## 유사 사례에서의 학습"]
 
+    # 유사 사례 원본 질문 (맥락 제공)
+    if learning_data.get("similar_queries"):
+        sections.append("\n**유사 과거 사례:**")
+        for sq in learning_data["similar_queries"][:2]:
+            sections.append(f"- 질문: {sq['query']}")
+
     # 답변 작성 교훈 (가장 중요)
     if learning_data.get("response_lessons"):
         sections.append("\n**답변 작성 시 참고:**")
@@ -747,147 +998,174 @@ async def handle_csm_thread_reply(
     logger.info(f"[CSM REPLY] Processing feedback: {csm_message[:100]}...")
 
     try:
-        # Analyze CSM's intent
-        conversation_context = _format_session_context(session)
-        analysis = await analyze_csm_reply(csm_message, conversation_context)
+        # Process CSM's natural language request via agent
+        session_context = _format_session_context(session)
+        claude = get_claude_client()
+        analysis = await claude.process_csm_request(csm_message, session_context)
 
-        intent = analysis.get("intent", "other")
-        logger.info(f"CSM intent: {intent}")
+        action = analysis.get("action", "answer")
+        logger.info(f"CSM agent action: {action}")
 
         # Update session with feedback (thread-safe)
         async with _session_lock:
             session["feedback"].append(csm_message)
             session["iteration_count"] += 1
 
-        # Handle different intents
-        if intent == "approval":
-            # CSM approves - provide deliver button for the latest response
-            last_response_ts = None
-            response_messages = session.get("response_messages", {})
-            if response_messages:
-                last_response_ts = list(response_messages.keys())[-1]
-
-            button_value = json.dumps({"csm_thread_ts": thread_ts})
-            approval_blocks = [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": "✓ 확인했습니다! 아래 버튼으로 고객에게 전달하거나, 원본 메시지에 :완료: 이모지를 추가하여 히스토리에 저장해주세요."
-                    }
-                },
-                {
-                    "type": "actions",
-                    "elements": [{
-                        "type": "button",
-                        "text": {
-                            "type": "plain_text",
-                            "text": "📨 고객에게 전달",
-                            "emoji": True
-                        },
-                        "style": "primary",
-                        "action_id": "deliver_to_customer",
-                        "value": button_value
-                    }]
-                }
-            ]
-            await client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text="✓ 확인했습니다. 아래 버튼으로 고객에게 전달해주세요.",
-                blocks=approval_blocks
-            )
-            return
-
-        # For other intents, generate improved response
+        # Handle different actions
         context = session.get("context", "")
-        additional_context = analysis.get("context", "")
 
-        # If additional search is requested, do it
-        if intent == "additional_search" and analysis.get("keywords"):
+        if action == "search":
+            # Search for more resources and post as a resource list
             keywords = analysis.get("keywords", [])
+            if not keywords:
+                keywords = [csm_message]
             logger.info(f"Additional search requested: {keywords}")
 
+            all_new_results = []
             for keyword in keywords:
                 new_results = await hybrid_search(keyword)
                 if new_results:
-                    # Add new context
+                    all_new_results.extend(new_results)
                     new_context = format_context_for_llm(new_results, current_channel_id=None)
                     context = f"{context}\n\n## 추가 검색 결과 ({keyword})\n{new_context}"
+                    async with _session_lock:
+                        session["search_queries"].append(keyword)
+                        session["search_results_titles"].extend([r.title for r in new_results])
+                        session["context"] = context
+                        existing = session.get("search_results", [])
+                        session["search_results"] = existing + new_results
 
-                    # Track search
-                    session["search_queries"].append(keyword)
-                    session["search_results_titles"].extend([r.title for r in new_results])
+            if all_new_results:
+                try:
+                    all_new_results = await rerank_results(
+                        session["original_query"], all_new_results
+                    )
+                except Exception as e:
+                    logger.warning(f"[RERANK] Additional search rerank failed: {e}")
 
-        # Get previous response (either initial or last improved)
-        previous_response = (
-            session["improved_responses"][-1]
-            if session["improved_responses"]
-            else session["initial_response"]
-        )
-
-        # Generate improved response
-        improved_response = await generate_improved_response(
-            context=context,
-            original_query=session["original_query"],
-            previous_response=previous_response,
-            csm_feedback=csm_message,
-            additional_context=additional_context
-        )
-
-        # Store improved response (thread-safe)
-        async with _session_lock:
-            session["improved_responses"].append(improved_response)
-
-        # Build Block Kit response with delivery button
-        iteration = session["iteration_count"]
-        blocks, fallback_text = build_improved_response_blocks(
-            response=improved_response,
-            iteration=iteration,
-            search_results=None,  # Already included in the response
-            button_value="",  # Placeholder - updated after posting
-            ticket_user=session.get("ticket_user", "")
-        )
-
-        # Try with Block Kit first, fall back to plain text if blocks fail
-        try:
-            post_result = await client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=fallback_text,
-                blocks=blocks
-            )
-        except Exception as block_err:
-            logger.warning(f"Block Kit posting failed for improved response, falling back to plain text: {block_err}")
-            post_result = await client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=fallback_text
-            )
-            blocks = None
-
-        # Update button value with actual message ts (skip if blocks failed)
-        response_msg_ts = post_result.get("ts", "")
-        if response_msg_ts and blocks:
-            button_value = json.dumps({"csm_thread_ts": thread_ts})
-            updated_blocks = update_button_value(blocks, button_value)
-            try:
-                await client.chat_update(
-                    channel=channel,
-                    ts=response_msg_ts,
-                    text=fallback_text,
-                    blocks=updated_blocks
+                add_blocks, add_fallback = build_csm_resource_list_blocks(
+                    search_results=all_new_results,
+                    original_query=session["original_query"],
+                    original_channel=session["original_channel"],
+                    original_ts=session["original_ts"],
+                    channel_name=session.get("channel_name", ""),
+                    ticket_user=""
                 )
-            except Exception as e:
-                logger.warning(f"Failed to update button value: {e}")
+                if add_blocks and add_blocks[0].get("type") == "section":
+                    add_blocks[0]["text"]["text"] = f"🔍 *추가 검색 결과* ({', '.join(keywords)})"
 
-            # Track response in session
+                try:
+                    await client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=add_fallback,
+                        blocks=add_blocks
+                    )
+                except Exception as block_err:
+                    logger.warning(f"Block Kit failed for additional search, falling back: {block_err}")
+                    await client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=add_fallback
+                    )
+            else:
+                await client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=f"🔍 `{', '.join(keywords)}` 키워드로 검색했지만 관련 자료를 찾지 못했습니다."
+                )
+            return
+
+        elif action == "respond":
+            # Generate a customer response based on accumulated search results
+            logger.info("[CSM REPLY] Writing customer response based on resources")
+
+            all_results = session.get("search_results", [])
+            write_context = format_context_for_llm(all_results, current_channel_id=None)
+
+            # Append learning context from similar past cases
+            lc = session.get("learning_context", "")
+            if lc:
+                write_context = f"{write_context}\n\n{lc}"
+
+            from src.llm.prompts import get_write_response_system_prompt, get_write_response_prompt
+
+            csm_instruction = analysis.get("instruction", "")
+            # Pass sub_questions from query analysis for numbered Q→A mapping
+            qa = session.get("query_analysis") or {}
+            sub_questions = qa.get("sub_questions", [])
+            prompt = get_write_response_prompt(
+                context=write_context,
+                original_query=session["original_query"],
+                csm_instruction=csm_instruction,
+                sub_questions=sub_questions
+            )
+
+            written_response = await claude.async_client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=3000,
+                system=get_write_response_system_prompt(),
+                messages=[{"role": "user", "content": prompt}]
+            )
+            written_text = written_response.content[0].text if written_response.content else ""
+
             async with _session_lock:
-                if "response_messages" not in session:
-                    session["response_messages"] = {}
-                session["response_messages"][response_msg_ts] = improved_response
+                session["improved_responses"].append(written_text)
+                session["context"] = write_context
 
-        logger.info(f"[CSM REPLY] Posted improved response #{iteration}")
+            iteration = session["iteration_count"]
+            button_value = json.dumps({"csm_thread_ts": thread_ts})
+            blocks, fallback_text = build_improved_response_blocks(
+                response=written_text,
+                iteration=iteration,
+                search_results=None,
+                button_value=button_value,
+                ticket_user=session.get("ticket_user", "")
+            )
+
+            try:
+                post_result = await client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=fallback_text,
+                    blocks=blocks
+                )
+            except Exception as block_err:
+                logger.warning(f"Block Kit failed for write_response, falling back: {block_err}")
+                post_result = await client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=fallback_text
+                )
+                blocks = None
+
+            response_msg_ts = post_result.get("ts", "")
+            if response_msg_ts:
+                async with _session_lock:
+                    if "response_messages" not in session:
+                        session["response_messages"] = {}
+                    session["response_messages"][response_msg_ts] = written_text
+
+            logger.info(f"[CSM REPLY] Posted written response #{iteration}")
+
+            # Auto-extract learning if CSM gave feedback (iteration >= 1)
+            if iteration >= 1 and not session.get("auto_learned_at"):
+                asyncio.create_task(_auto_extract_learning(session, thread_ts))
+
+            return
+
+        else:
+            # answer action — CSM 질문에 직접 답변
+            answer_text = analysis.get("message", "")
+            if not answer_text:
+                answer_text = "요청을 처리할 수 없습니다. 다시 말씀해주세요."
+            logger.info(f"[CSM REPLY] Direct answer to CSM ({len(answer_text)} chars)")
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=answer_text
+            )
+            return
 
     except Exception as e:
         logger.error(f"Error processing CSM reply: {e}", exc_info=True)
@@ -992,7 +1270,7 @@ async def handle_deliver_to_customer(ack, body, client):
         await client.chat_update(
             channel=csm_channel,
             ts=msg_ts,
-            text=f"✅ 전달 완료 | {customer_thread_url}",
+            text=f":완료: 전달 완료 | {customer_thread_url}",
             blocks=confirmed_blocks
         )
 
@@ -1020,19 +1298,48 @@ async def handle_deliver_to_customer(ack, body, client):
 
 
 def _format_session_context(session: Dict[str, Any]) -> str:
-    """Format session data as conversation context for LLM.
+    """Format session data as rich context for CSM agent.
 
     Args:
         session: CSM session data
 
     Returns:
-        Formatted context string
+        Formatted context string including search results details
     """
     parts = []
 
-    parts.append(f"[원본 문의]\n{session['original_query'][:500]}")
-    parts.append(f"[초기 답변]\n{session['initial_response'][:500]}")
+    parts.append(f"[원본 고객 문의]\n{session['original_query'][:500]}")
 
+    # Include post-rerank results (shown to CSM)
+    search_results = session.get("search_results", [])
+    if search_results:
+        results_lines = []
+        for i, r in enumerate(search_results, 1):
+            source = getattr(r, 'source', 'unknown')
+            title = getattr(r, 'title', 'Untitled')
+            url = getattr(r, 'url', '')
+            snippet = getattr(r, 'snippet', '')[:200]
+            results_lines.append(f"  {i}. [{source}] {title}\n     URL: {url}\n     요약: {snippet}")
+        parts.append(f"[관련성 높은 자료 (CSM에게 표시됨, {len(search_results)}건)]\n" + "\n".join(results_lines))
+
+    # Include pre-rerank results (filtered out but may be referenced)
+    all_results = session.get("all_search_results", [])
+    filtered_out = [r for r in all_results if r not in search_results]
+    if filtered_out:
+        filtered_lines = []
+        for i, r in enumerate(filtered_out, 1):
+            source = getattr(r, 'source', 'unknown')
+            title = getattr(r, 'title', 'Untitled')
+            url = getattr(r, 'url', '')
+            filtered_lines.append(f"  {i}. [{source}] {title}\n     URL: {url}")
+        parts.append(f"[관련성 낮아 제외된 자료 ({len(filtered_out)}건)]\n" + "\n".join(filtered_lines))
+
+    # Include initial response if exists
+    initial = session.get('initial_response', '')
+    if initial:
+        parts.append(f"[초기 답변]\n{initial[:500]}")
+
+    # Include feedback and improved responses
     for i, (fb, resp) in enumerate(zip(session.get("feedback", []), session.get("improved_responses", []))):
         parts.append(f"[CSM 피드백 #{i+1}]\n{fb[:300]}")
         parts.append(f"[개선 답변 #{i+1}]\n{resp[:300]}")
@@ -1079,7 +1386,7 @@ async def handle_complete_emoji(
                 csm_thread_ts = message_ts
         else:
             # Search for session by original_channel + original_ts
-            # (when ✅ is added on the original customer message)
+            # (when :완료: is added on the original customer message)
             for csm_ts, s in _csm_sessions.items():
                 if s.get("original_channel") == channel and s.get("original_ts") == message_ts:
                     session = s
@@ -1305,7 +1612,7 @@ async def handle_complete_emoji(
             if csm_thread_ts and settings.csm_response_channel_id:
                 try:
                     summary_parts = [
-                        "✅ *history와 학습내용이 저장되었습니다.*\n",
+                        ":완료: *history와 학습내용이 저장되었습니다.*\n",
                         f"*저장 요약*",
                         f"- 히스토리 ID: `{entry_id[:8]}...`",
                     ]

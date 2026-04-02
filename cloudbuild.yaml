@@ -49,7 +49,7 @@ steps:
       - '--set-env-vars'
       - 'STORAGE_BACKEND=gcs,GCP_STORAGE_BUCKET=${_GCS_BUCKET},HISTORY_API_ENABLED=true,PYTHONUNBUFFERED=1,COMPLETE_EMOJI=완료'
       - '--update-secrets'
-      - 'SLACK_BOT_TOKEN=slack-bot-token:latest,SLACK_APP_TOKEN=slack-app-token:latest,ANTHROPIC_API_KEY=anthropic-api-key:latest,CSM_RESPONSE_CHANNEL_ID=csm-response-channel-id:latest'
+      - 'SLACK_BOT_TOKEN=slack-bot-token:latest,SLACK_APP_TOKEN=slack-app-token:latest,ANTHROPIC_API_KEY=anthropic-api-key:latest,CSM_RESPONSE_CHANNEL_ID=csm-response-channel-id:latest,SLACK_USER_TOKEN=slack-user-token:latest,NOTION_TOKEN=notion-token:latest,SLACK_SEARCH_CHANNEL_IDS=slack-search-channel-ids:latest,NOTION_DB_IDS=notion-db-ids:latest'
 
 images:
   - 'gcr.io/${PROJECT_ID}/${_SERVICE_NAME}:${_TAG}'

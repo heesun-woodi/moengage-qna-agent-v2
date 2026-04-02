@@ -13,6 +13,7 @@ from anthropic import AsyncAnthropic
 from config.settings import settings
 from src.knowledge.history_rag import get_history_rag, HistoryEntry
 from src.knowledge.history_updater import classify_category, CATEGORY_KEYWORDS
+from src.llm.prompts import get_pdf_parser_system_prompt
 from src.utils.logger import logger
 
 # Try to import pdfplumber
@@ -312,7 +313,7 @@ class PDFHistoryImporter:
         response = await client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1500,
-            system=PDF_PARSER_SYSTEM_PROMPT,
+            system=get_pdf_parser_system_prompt(),
             messages=[
                 {
                     "role": "user",
@@ -580,123 +581,6 @@ class PDFHistoryImporter:
 
         return results
 
-    async def import_pdf_remote(self, pdf_path: Path, force: bool = False) -> Optional[str]:
-        """Import a single PDF file to remote Railway API.
-
-        Args:
-            pdf_path: Path to PDF file
-            force: Force re-import even if already imported
-
-        Returns:
-            Entry ID if successful, None otherwise
-        """
-        from src.knowledge.history_api_client import HistoryAPIClient
-
-        self._current_pdf_path = pdf_path
-
-        if not pdf_path.exists():
-            logger.error(f"PDF file not found: {pdf_path}")
-            return None
-
-        # Read file for hash
-        with open(pdf_path, 'rb') as f:
-            pdf_bytes = f.read()
-
-        filename = pdf_path.name
-        file_hash = self._file_hash(pdf_bytes)
-
-        # Check if already imported (local tracker)
-        if not force and self._is_imported(filename, file_hash):
-            logger.info(f"PDF already imported: {filename}")
-            return self._tracker["imported_files"][filename].get("entry_id")
-
-        logger.info(f"Importing PDF to remote: {filename}")
-
-        try:
-            # Extract text and images
-            text, images = self._extract_text_and_images(pdf_path)
-
-            if not text.strip():
-                logger.warning(f"No text extracted from PDF: {filename}")
-                return None
-
-            logger.info(f"Extracted {len(text)} chars and {len(images)} images from {filename}")
-
-            # Analyze images with Vision
-            image_analyses = await self._analyze_images_with_vision(images)
-
-            # Parse with Claude
-            result = await self._parse_with_claude(text, image_analyses)
-
-            logger.info(f"Parsed PDF - Title: {result.title}, Customer: {result.customer}, Category: {result.category}")
-
-            # Map to HistoryEntry
-            entry = self._map_to_history_entry(result, filename)
-
-            # Send to remote API instead of local RAG
-            client = HistoryAPIClient()
-            entry_id = await client.add_entry(entry)
-
-            if entry_id:
-                # Mark as imported in local tracker
-                self._mark_imported(filename, file_hash, entry_id)
-                logger.info(f"Successfully imported PDF to remote: {filename} -> {entry_id}")
-                return entry_id
-            else:
-                logger.error(f"Failed to import PDF to remote: {filename}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Failed to import PDF {filename}: {e}", exc_info=True)
-            return None
-
-    async def import_all_remote(self, force: bool = False) -> Dict[str, Any]:
-        """Import all PDF files from the directory to remote Railway API.
-
-        Args:
-            force: Force re-import all files
-
-        Returns:
-            Summary of import results
-        """
-        if not self.pdf_dir.exists():
-            logger.warning(f"PDF directory does not exist: {self.pdf_dir}")
-            return {"success": 0, "skipped": 0, "failed": 0, "errors": []}
-
-        pdf_files = list(self.pdf_dir.glob("*.pdf"))
-        logger.info(f"Found {len(pdf_files)} PDF files in {self.pdf_dir}")
-
-        results = {
-            "success": 0,
-            "skipped": 0,
-            "failed": 0,
-            "errors": [],
-            "imported_entries": []
-        }
-
-        for pdf_path in pdf_files:
-            try:
-                entry_id = await self.import_pdf_remote(pdf_path, force=force)
-                if entry_id:
-                    results["success"] += 1
-                    results["imported_entries"].append({
-                        "filename": pdf_path.name,
-                        "entry_id": entry_id
-                    })
-                else:
-                    # Check if skipped due to already imported
-                    filename = pdf_path.name
-                    if filename in self._tracker["imported_files"] and not force:
-                        results["skipped"] += 1
-                    else:
-                        results["failed"] += 1
-            except Exception as e:
-                results["failed"] += 1
-                results["errors"].append({
-                    "filename": pdf_path.name,
-                    "error": str(e)
-                })
-                logger.error(f"Error importing {pdf_path.name}: {e}")
 
         logger.info(
             f"Remote import complete: {results['success']} success, "

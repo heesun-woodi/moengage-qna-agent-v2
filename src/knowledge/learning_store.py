@@ -29,7 +29,6 @@ from src.knowledge.history_updater import (
     ResponseEvolution,
     SearchIteration,
 )
-from src.knowledge.learning_api_client import get_learning_api_client, is_learning_api_configured
 
 
 class LearningStore:
@@ -383,6 +382,21 @@ class LearningStore:
         self._save()
         logger.info("Learning Store cleared")
 
+    def get_recent_entries(self, hours: int = 24) -> list:
+        """Get entries completed within the last N hours."""
+        from datetime import timedelta
+        cutoff = datetime.now() - timedelta(hours=hours)
+        recent = []
+        for entry in self.entries.values():
+            completed = getattr(entry, 'completed_at', None)
+            if completed:
+                try:
+                    if datetime.fromisoformat(completed) >= cutoff:
+                        recent.append(entry)
+                except (ValueError, TypeError):
+                    continue
+        return recent
+
     def get_statistics(self) -> Dict[str, Any]:
         """Get statistics about the learning store."""
         if not self.entries:
@@ -583,8 +597,6 @@ def get_learning_store():
 async def save_learning_entry(entry: LearningEntry) -> str:
     """Async wrapper for saving a learning entry.
 
-    Saves to both local FAISS store and Railway API if configured.
-
     Args:
         entry: LearningEntry to save
 
@@ -593,179 +605,20 @@ async def save_learning_entry(entry: LearningEntry) -> str:
     """
     store = get_learning_store()
     entry_id = store.add_entry(entry)
-    logger.info(f"Saved learning entry to local store: {entry_id}")
-
-    # Also save to Railway if configured
-    if is_learning_api_configured():
-        try:
-            api_client = get_learning_api_client()
-            if api_client:
-                entry.id = entry_id  # Use same ID for consistency
-                remote_id = await api_client.add_entry(entry.to_dict())
-                if remote_id:
-                    logger.info(f"Saved learning entry to Railway: {remote_id}")
-                else:
-                    logger.warning(f"Failed to save learning to Railway, local save successful: {entry_id}")
-        except Exception as e:
-            logger.error(f"Railway Learning API error (local save successful): {e}")
+    logger.info(f"Saved learning entry: {entry_id}")
 
     return entry_id
 
 
 async def get_learning_for_query(query: str, top_k: int = 3) -> Dict[str, Any]:
-    """Get learning points from local store and optionally merge with Railway.
+    """Get learning points for a query.
 
     Args:
         query: Customer query
         top_k: Number of similar entries to consider
 
     Returns:
-        Aggregated learning points from local + remote sources
+        Aggregated learning points
     """
     store = get_learning_store()
-    local_result = store.get_learning_points_for_query(query, top_k)
-
-    # Try to get remote learning data if configured
-    if is_learning_api_configured():
-        try:
-            remote_result = await _fetch_remote_learning(query, top_k)
-            if remote_result and remote_result.get("has_learning"):
-                local_result = _merge_learning_results(local_result, remote_result)
-                logger.info("[LEARNING] Merged local + remote learning data")
-        except Exception as e:
-            logger.warning(f"[LEARNING] Remote fetch failed, using local only: {e}")
-
-    return local_result
-
-
-async def _fetch_remote_learning(query: str, top_k: int) -> Optional[Dict[str, Any]]:
-    """Fetch learning data from Railway API.
-
-    Note: Railway API doesn't have semantic search, so we fetch recent entries
-    and do client-side filtering based on keywords.
-    """
-    api_client = get_learning_api_client()
-    if not api_client:
-        return None
-
-    try:
-        # Fetch recent entries from Railway
-        result = await api_client.list_entries(limit=50)
-        if not result or not result.get("entries"):
-            return None
-
-        # Simple keyword matching for now
-        # (Full semantic search would require Railway-side embedding)
-        query_lower = query.lower()
-        matched_entries = []
-
-        for entry_dict in result.get("entries", []):
-            entry_query = entry_dict.get("original_query", "").lower()
-            # Simple overlap score
-            query_words = set(query_lower.split())
-            entry_words = set(entry_query.split())
-            if not query_words:
-                continue
-            overlap = len(query_words & entry_words)
-            if overlap >= 2:  # At least 2 words match
-                matched_entries.append((entry_dict, overlap / len(query_words)))
-
-        if not matched_entries:
-            return {"has_learning": False}
-
-        # Sort by score and take top_k
-        matched_entries.sort(key=lambda x: x[1], reverse=True)
-        matched_entries = matched_entries[:top_k]
-
-        # Format as learning result
-        return _format_remote_entries_as_learning(matched_entries)
-
-    except Exception as e:
-        logger.warning(f"Remote learning fetch error: {e}")
-        return None
-
-
-def _format_remote_entries_as_learning(entries: list) -> Dict[str, Any]:
-    """Format remote entries as learning result dict."""
-    if not entries:
-        return {"has_learning": False}
-
-    query_lessons = []
-    search_lessons = []
-    response_lessons = []
-    similar_queries = []
-
-    for entry_dict, score in entries:
-        lp = entry_dict.get("learning_points", {})
-
-        if lp.get("query_lesson"):
-            query_lessons.append({
-                "lesson": lp["query_lesson"],
-                "score": score,
-                "original_query": entry_dict.get("original_query", "")[:100],
-            })
-        if lp.get("search_lesson"):
-            search_lessons.append({
-                "lesson": lp["search_lesson"],
-                "score": score,
-            })
-        if lp.get("response_lesson"):
-            response_lessons.append({
-                "lesson": lp["response_lesson"],
-                "score": score,
-            })
-
-        similar_queries.append({
-            "query": entry_dict.get("original_query", "")[:200],
-            "final_response": entry_dict.get("response_evolution", {}).get("final_response", "")[:500],
-            "score": score,
-        })
-
-    return {
-        "has_learning": True,
-        "query_lessons": query_lessons,
-        "search_lessons": search_lessons,
-        "response_lessons": response_lessons,
-        "similar_queries": similar_queries,
-        "source": "remote",
-    }
-
-
-def _merge_learning_results(local: Dict[str, Any], remote: Dict[str, Any]) -> Dict[str, Any]:
-    """Merge local and remote learning results, deduplicating by lesson text."""
-    if not local.get("has_learning") and not remote.get("has_learning"):
-        return {"has_learning": False}
-
-    # Combine and deduplicate
-    seen_lessons: set = set()
-
-    def dedupe_lessons(local_list: list, remote_list: list) -> list:
-        result = []
-        for item in local_list + remote_list:
-            lesson_text = item.get("lesson", "")
-            if lesson_text and lesson_text not in seen_lessons:
-                seen_lessons.add(lesson_text)
-                result.append(item)
-        # Sort by score descending
-        result.sort(key=lambda x: x.get("score", 0), reverse=True)
-        return result[:3]  # Keep top 3
-
-    return {
-        "has_learning": True,
-        "query_lessons": dedupe_lessons(
-            local.get("query_lessons", []),
-            remote.get("query_lessons", [])
-        ),
-        "search_lessons": dedupe_lessons(
-            local.get("search_lessons", []),
-            remote.get("search_lessons", [])
-        ),
-        "response_lessons": dedupe_lessons(
-            local.get("response_lessons", []),
-            remote.get("response_lessons", [])
-        ),
-        "similar_queries": (
-            local.get("similar_queries", []) +
-            remote.get("similar_queries", [])
-        )[:5],
-    }
+    return store.get_learning_points_for_query(query, top_k)

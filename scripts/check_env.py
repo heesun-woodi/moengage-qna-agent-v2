@@ -90,7 +90,11 @@ def check_env():
         "REDIS_URL": os.getenv("REDIS_URL", "redis://localhost:6379"),
         "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO"),
         "TICKET_EMOJI": os.getenv("TICKET_EMOJI", "ticket"),
-        "COMPLETE_EMOJI": os.getenv("COMPLETE_EMOJI", "white_check_mark"),
+        "COMPLETE_EMOJI": os.getenv("COMPLETE_EMOJI", "완료"),
+        "SLACK_USER_TOKEN": os.getenv("SLACK_USER_TOKEN", "(미설정 - Slack 메시지 검색 비활성화)"),
+        "SLACK_SEARCH_CHANNEL_IDS": os.getenv("SLACK_SEARCH_CHANNEL_IDS", "(미설정 - 전체 채널 검색)"),
+        "NOTION_TOKEN": os.getenv("NOTION_TOKEN", "(미설정 - Notion 검색 비활성화)"),
+        "NOTION_DB_IDS": os.getenv("NOTION_DB_IDS", "(미설정)"),
     }
 
     for var_name, value in optional.items():

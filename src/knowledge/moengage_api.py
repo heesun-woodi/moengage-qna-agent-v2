@@ -1,6 +1,7 @@
 """MoEngage Help Center API client using Zendesk Search API."""
 
 import asyncio
+import re
 from typing import List, Optional
 from dataclasses import dataclass
 
@@ -29,6 +30,11 @@ _cache: TTLCache = TTLCache(
     maxsize=100,
     ttl=settings.moengage_api_cache_ttl
 )
+
+
+def _strip_html_tags(text: str) -> str:
+    """Strip HTML tags from text (e.g. <em>keyword</em> → keyword)."""
+    return re.sub(r'<[^>]+>', '', text) if text else ""
 
 
 def _html_to_text(html_content: str, max_length: int = 2000) -> str:
@@ -64,6 +70,74 @@ def _html_to_text(html_content: str, max_length: int = 2000) -> str:
     return text
 
 
+async def _search_zendesk_hc(
+    query: str,
+    base_url: str,
+    source_key: str,
+    top_k: int = 5,
+    translate_query: bool = True
+) -> List[SearchResult]:
+    """Generic Zendesk Help Center search.
+
+    Args:
+        query: Search query (Korean or English)
+        base_url: Base URL of the Zendesk Help Center
+        source_key: Source identifier for results (e.g. "moengage_docs", "developer_docs")
+        top_k: Number of results to return
+        translate_query: Whether to translate Korean query to English
+
+    Returns:
+        List of SearchResult objects
+    """
+    # Translate Korean query to English for better results
+    search_query = query
+    if translate_query:
+        english_query = translate_for_search(query)
+        if english_query != query:
+            search_query = f"{query} {english_query}"
+            logger.debug(f"Expanded query: {query} -> {search_query}")
+
+    # Check cache
+    cache_key = f"{base_url}:{search_query}:{top_k}"
+    if cache_key in _cache:
+        logger.debug(f"Cache hit for {source_key} query: {query}")
+        return _cache[cache_key]
+
+    # Call Zendesk Search API
+    url = f"{base_url}/api/v2/help_center/articles/search.json"
+    params = {
+        "query": search_query,
+        "per_page": top_k
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as e:
+        logger.warning(f"[{source_key}] Search failed for '{query}': {e}")
+        return []
+
+    results: List[SearchResult] = []
+    for article in data.get("results", []):
+        content = _html_to_text(article.get("body", ""))
+        if len(content) < 50:
+            continue
+        result = SearchResult(
+            title=article.get("title", ""),
+            url=article.get("html_url", ""),
+            content=content,
+            snippet=_strip_html_tags(article.get("snippet", ""))[:200] if article.get("snippet") else content[:200],
+            source=source_key
+        )
+        results.append(result)
+
+    _cache[cache_key] = results
+    logger.info(f"[{source_key}] Found {len(results)} results for '{query}'")
+    return results
+
+
 @retry_moengage_api
 @moengage_circuit
 async def search_moengage(
@@ -71,68 +145,45 @@ async def search_moengage(
     top_k: Optional[int] = None,
     translate_query: bool = True
 ) -> List[SearchResult]:
-    """Search MoEngage Help Center using Zendesk Search API.
-
-    Args:
-        query: Search query (Korean or English)
-        top_k: Number of results to return
-        translate_query: Whether to translate Korean query to English
-
-    Returns:
-        List of SearchResult objects
-    """
+    """Search MoEngage User Guide (help.moengage.com)."""
     top_k = top_k or settings.moengage_search_top_k
+    return await _search_zendesk_hc(
+        query=query,
+        base_url=settings.moengage_help_center_url,
+        source_key="moengage_docs",
+        top_k=top_k,
+        translate_query=translate_query
+    )
 
-    # Translate Korean query to English for better results
-    search_query = query
-    if translate_query:
-        english_query = translate_for_search(query)
-        if english_query != query:
-            # Use both original and translated for broader search
-            search_query = f"{query} {english_query}"
-            logger.debug(f"Expanded query: {query} -> {search_query}")
 
-    # Check cache
-    cache_key = f"{search_query}:{top_k}"
-    if cache_key in _cache:
-        logger.debug(f"Cache hit for query: {query}")
-        return _cache[cache_key]
+async def search_developer_docs(
+    query: str,
+    top_k: int = 3,
+    translate_query: bool = True
+) -> List[SearchResult]:
+    """Search MoEngage Developer Guide (developers.moengage.com)."""
+    return await _search_zendesk_hc(
+        query=query,
+        base_url="https://developers.moengage.com",
+        source_key="developer_docs",
+        top_k=top_k,
+        translate_query=translate_query
+    )
 
-    # Call Zendesk Search API
-    url = f"{settings.moengage_help_center_url}/api/v2/help_center/articles/search.json"
-    params = {
-        "query": search_query,
-        "per_page": top_k
-    }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-
-    results: List[SearchResult] = []
-    for article in data.get("results", []):
-        # Extract and clean content
-        content = _html_to_text(article.get("body", ""))
-
-        # Skip empty or minimal content
-        if len(content) < 50:
-            continue
-
-        result = SearchResult(
-            title=article.get("title", ""),
-            url=article.get("html_url", ""),
-            content=content,
-            snippet=article.get("snippet", "")[:200] if article.get("snippet") else content[:200],
-            source="moengage_docs"
-        )
-        results.append(result)
-
-    # Cache results
-    _cache[cache_key] = results
-
-    logger.info(f"MoEngage API: Found {len(results)} results for '{query}'")
-    return results
+async def search_partner_docs(
+    query: str,
+    top_k: int = 3,
+    translate_query: bool = True
+) -> List[SearchResult]:
+    """Search MoEngage Partner Guide (partners.moengage.com)."""
+    return await _search_zendesk_hc(
+        query=query,
+        base_url="https://partners.moengage.com",
+        source_key="partner_docs",
+        top_k=top_k,
+        translate_query=translate_query
+    )
 
 
 async def get_article_by_id(article_id: int) -> Optional[SearchResult]:

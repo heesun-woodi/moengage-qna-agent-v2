@@ -22,6 +22,7 @@ def extract_json_safely(text: str) -> dict:
     patterns = [
         r'```json\s*([\s\S]*?)\s*```',  # ```json ... ```
         r'```\s*([\s\S]*?)\s*```',       # ``` ... ```
+        r'\[[\s\S]*\]',                   # Raw [ ... ] (JSON array - before {} to avoid matching inner objects)
         r'\{[\s\S]*\}',                   # Raw { ... }
     ]
 
@@ -48,11 +49,13 @@ from src.llm.prompts import (
     THREAD_ANALYZER_SYSTEM_PROMPT,
     CSM_CONVERSATIONAL_PROMPT,
     LEARNING_EXTRACTION_SYSTEM_PROMPT,
-    CSM_REPLY_ANALYSIS_SYSTEM_PROMPT,
+    get_support_bot_system_prompt,
+    get_thread_analyzer_system_prompt,
+    get_csm_conversational_system_prompt,
+    get_learning_extraction_system_prompt,
     get_support_prompt,
     get_thread_analysis_prompt,
     get_learning_extraction_prompt,
-    get_csm_reply_analysis_prompt,
 )
 
 
@@ -99,7 +102,7 @@ class ClaudeClient:
         response = await self.async_client.messages.create(
             model=model,
             max_tokens=self.MAX_TOKENS,
-            system=SUPPORT_BOT_SYSTEM_PROMPT,
+            system=get_support_bot_system_prompt(),
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -134,7 +137,7 @@ class ClaudeClient:
         response = await self.async_client.messages.create(
             model=model,
             max_tokens=self.MAX_TOKENS,
-            system=THREAD_ANALYZER_SYSTEM_PROMPT,
+            system=get_thread_analyzer_system_prompt(),
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -181,7 +184,7 @@ class ClaudeClient:
         async with self.async_client.messages.stream(
             model=model,
             max_tokens=self.MAX_TOKENS,
-            system=SUPPORT_BOT_SYSTEM_PROMPT,
+            system=get_support_bot_system_prompt(),
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -222,7 +225,7 @@ class ClaudeClient:
         response = await self.async_client.messages.create(
             model=model,
             max_tokens=self.MAX_TOKENS,
-            system=CSM_CONVERSATIONAL_PROMPT,
+            system=get_csm_conversational_system_prompt(),
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -271,7 +274,7 @@ class ClaudeClient:
         response = await self.async_client.messages.create(
             model=model,
             max_tokens=1024,
-            system=LEARNING_EXTRACTION_SYSTEM_PROMPT,
+            system=get_learning_extraction_system_prompt(),
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -295,31 +298,33 @@ class ClaudeClient:
 
     @retry_claude_api
     @claude_circuit
-    async def analyze_csm_reply(
+    async def process_csm_request(
         self,
         csm_message: str,
-        conversation_context: str = "",
+        session_context: str,
         model: Optional[str] = None
     ) -> dict:
-        """Analyze CSM's reply to understand their intent.
+        """Process CSM's natural language request as an agent.
 
         Args:
-            csm_message: CSM's feedback message
-            conversation_context: Previous conversation for context
+            csm_message: CSM's message in the thread
+            session_context: Rich session context (search results, feedback, etc.)
             model: Model to use
 
         Returns:
-            Dictionary with intent, keywords, context, instruction
+            Dictionary with action, keywords, instruction, message
         """
-        model = model or self.DEFAULT_MODEL
-        prompt = get_csm_reply_analysis_prompt(csm_message, conversation_context)
+        from src.llm.prompts import get_csm_agent_system_prompt, get_csm_agent_prompt
 
-        logger.debug(f"Analyzing CSM reply: {csm_message[:100]}...")
+        model = model or self.DEFAULT_MODEL
+        prompt = get_csm_agent_prompt(csm_message, session_context)
+
+        logger.debug(f"Processing CSM request: {csm_message[:100]}...")
 
         response = await self.async_client.messages.create(
             model=model,
-            max_tokens=512,
-            system=CSM_REPLY_ANALYSIS_SYSTEM_PROMPT,
+            max_tokens=1024,
+            system=get_csm_agent_system_prompt(),
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -330,15 +335,16 @@ class ClaudeClient:
         # Parse JSON from response using robust extraction
         result = extract_json_safely(result_text)
         if result:
-            logger.info(f"CSM reply intent: {result.get('intent', 'unknown')}")
+            action = result.get("action", "answer")
+            logger.info(f"CSM agent action: {action}")
             return result
         else:
-            logger.error("Failed to parse CSM reply analysis JSON")
+            logger.error("Failed to parse CSM agent response JSON")
             return {
-                "intent": "other",
+                "action": "answer",
                 "keywords": [],
-                "context": "",
-                "instruction": csm_message
+                "instruction": "",
+                "message": csm_message
             }
 
     @retry_claude_api
@@ -392,7 +398,7 @@ CSM의 피드백을 반영하여 개선된 답변을 작성해주세요.
         response = await self.async_client.messages.create(
             model=model,
             max_tokens=self.MAX_TOKENS,
-            system=SUPPORT_BOT_SYSTEM_PROMPT,
+            system=get_support_bot_system_prompt(),
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -484,20 +490,6 @@ async def extract_learning_points(
         improved_responses,
         final_response
     )
-
-
-async def analyze_csm_reply(csm_message: str, conversation_context: str = "") -> dict:
-    """Convenience function to analyze CSM reply.
-
-    Args:
-        csm_message: CSM's feedback message
-        conversation_context: Previous conversation context
-
-    Returns:
-        Analysis result
-    """
-    client = get_claude_client()
-    return await client.analyze_csm_reply(csm_message, conversation_context)
 
 
 async def extract_learning_from_thread(thread_messages: list) -> dict:

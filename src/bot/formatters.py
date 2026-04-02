@@ -85,7 +85,7 @@ def format_archiving_confirmation(entry_id: str, title: str) -> str:
         Formatted confirmation message
     """
     return (
-        f"✅ **문의 내용이 지원 히스토리에 저장되었습니다.**\n\n"
+        f":완료: **문의 내용이 지원 히스토리에 저장되었습니다.**\n\n"
         f"- 제목: {title}\n"
         f"- ID: `{entry_id[:8]}...`\n\n"
         "_이 기록은 향후 유사한 문의에 활용됩니다._"
@@ -183,7 +183,7 @@ def format_csm_ticket_response(
     footer = (
         "\n\n---\n"
         "_💡 답변이 불충분하면 이 스레드에서 추가 질문을 해주세요._\n"
-        "_✅ 최종 답변이 완성되면 원본 메시지에 :완료: 이모지를 추가해주세요._"
+        "_:완료: 최종 답변이 완성되면 원본 메시지에 :완료: 이모지를 추가해주세요._"
     )
 
     return header + formatted_response + footer
@@ -241,7 +241,7 @@ def format_learning_saved_confirmation(
     lessons_text = "\n".join(lessons) if lessons else "_학습 포인트 없음_"
 
     return (
-        f"✅ **학습 완료**\n\n"
+        f":완료: **학습 완료**\n\n"
         f"이 케이스가 학습 DB에 저장되었습니다. (ID: `{entry_id[:8]}...`)\n\n"
         f"**학습 포인트**\n{lessons_text}\n\n"
         "_이 경험은 향후 유사한 문의에 더 나은 답변을 생성하는 데 활용됩니다._"
@@ -500,7 +500,7 @@ def build_delivered_confirmation_blocks(
         "type": "section",
         "text": {
             "type": "mrkdwn",
-            "text": f"✅ *전달 완료* | <{customer_thread_url}|고객 스레드에서 보기>"
+            "text": f":완료: *전달 완료* | <{customer_thread_url}|고객 스레드에서 보기>"
         }
     })
 
@@ -550,3 +550,170 @@ def update_button_value(blocks: List[dict], new_value: str) -> List[dict]:
                 if element.get("action_id") == "deliver_to_customer":
                     element["value"] = new_value
     return blocks
+
+
+# Source metadata: (emoji, label)
+_SOURCE_META = {
+    "moengage_docs":   ("📚", "MoEngage User Guide"),
+    "developer_docs":  ("⚙️", "MoEngage Developer Guide"),
+    "partner_docs":    ("🤝", "MoEngage Partner Guide"),
+    "support_history": ("📋", "지원 히스토리"),
+    "slack_thread":    ("💬", "Slack 스레드"),
+    "notion":          ("📝", "Notion 문서"),
+}
+
+_SOURCE_ORDER = ["support_history", "moengage_docs", "developer_docs", "partner_docs", "slack_thread", "notion"]
+
+
+def build_csm_resource_list_blocks(
+    search_results: List[UnifiedSearchResult],
+    original_query: str,
+    original_channel: str,
+    original_ts: str,
+    channel_name: str = "",
+    ticket_user: str = "",
+    pre_rerank_by_source: Optional[dict] = None,
+    post_rerank_by_source: Optional[dict] = None
+) -> Tuple[List[dict], str]:
+    """Build Block Kit blocks showing a list of related resources (no generated answer).
+
+    This replaces build_csm_ticket_blocks() for the initial response.
+    CSM can then request additional searches or ask the bot to write a response.
+
+    Returns:
+        Tuple of (blocks, fallback_text)
+    """
+    from src.knowledge.hybrid_searcher import group_results_by_source
+
+    message_link = f"https://slack.com/archives/{original_channel}/p{original_ts.replace('.', '')}"
+    channel_display = f"*#{channel_name}*" if channel_name else ""
+
+    blocks: List[dict] = []
+
+    # User notification
+    if ticket_user:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"<@{ticket_user}> 님 관련 자료를 찾았습니다"}
+        })
+
+    # Header
+    query_preview = original_query[:400] + ("..." if len(original_query) > 400 else "")
+    header_text = (
+        f"📋 *새로운 문의* {channel_display}\n\n"
+        f"*원본 메시지*: <{message_link}|슬랙에서 보기>\n\n"
+        f"*고객 문의 내용*:\n>{query_preview}"
+    )
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": header_text}
+    })
+    blocks.append({"type": "divider"})
+
+    # Group results by source
+    grouped = group_results_by_source(search_results)
+    total_count = len(search_results)
+
+    if total_count == 0:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "_관련 자료를 찾지 못했습니다. 스레드에서 다른 키워드로 검색을 요청해보세요._"
+            }
+        })
+    else:
+        # Add each source section
+        for source_key in _SOURCE_ORDER:
+            items = grouped.get(source_key, [])
+            if not items:
+                continue
+
+            emoji, label = _SOURCE_META.get(source_key, ("📄", source_key))
+            section_header = f"*{emoji} {label}* ({len(items)}건)"
+
+            item_lines = []
+            for item in items[:5]:  # Max 5 per source
+                title = item.title[:60] + ("..." if len(item.title) > 60 else "")
+                # Only show snippet if it was set by reranker (Korean summary)
+                # Skip raw English snippets from Zendesk API
+                has_rerank_summary = item.metadata.get("evidence_type", "") if item.metadata else ""
+                snippet = ""
+                if has_rerank_summary:
+                    raw_snippet = item.snippet[:120].replace("\n", " ").strip()
+                    if raw_snippet:
+                        snippet = f" — _{raw_snippet}_"
+                url = item.url
+                if url and not url.startswith("history://"):
+                    item_lines.append(f"• <{url}|{title}>{snippet}")
+                else:
+                    item_lines.append(f"• {title}{snippet}")
+
+            section_text = section_header + "\n" + "\n".join(item_lines)
+            # Split if too long
+            for chunk in _split_text_for_blocks(section_text, max_length=2800):
+                blocks.append({
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": chunk}
+                })
+
+    # Source-level search status
+    if pre_rerank_by_source:
+        status_lines = []
+        for source_key in _SOURCE_ORDER:
+            if source_key == "support_history":
+                continue
+            emoji, label = _SOURCE_META.get(source_key, ("📄", source_key))
+            pre_count = pre_rerank_by_source.get(source_key, 0)
+            post_count = (post_rerank_by_source or {}).get(source_key, 0)
+
+            if post_count > 0:
+                # Already shown in resource list above — skip
+                continue
+            elif pre_count > 0:
+                # Searched and found, but filtered by relevance
+                status_lines.append(
+                    f"{emoji} {label}: {pre_count}건 검색되었으나 관련성이 낮아 제외됨 "
+                    f"(_\"관련성 낮은 자료도 보여줘\"로 요청 가능_)"
+                )
+            else:
+                # No results at all
+                status_lines.append(
+                    f"{emoji} {label}: 문의와 관련된 자료를 찾지 못했습니다"
+                )
+
+        if status_lines:
+            status_text = "\n".join(status_lines)
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": status_text}
+            })
+
+    # Footer guide
+    blocks.append({"type": "divider"})
+    blocks.append({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": (
+                "*💬 스레드에서 요청하세요:*\n"
+                "• 다른 자료 더 찾기: \"[키워드] 관련 자료 찾아줘\"\n"
+                "• 답변 작성: \"위 자료로 고객 답변 써줘\""
+            )
+        }
+    })
+
+    # Fallback plain text
+    fallback_lines = [
+        f"📋 새로운 문의 {channel_name and f'#{channel_name}' or ''}",
+        f"원본 메시지: {message_link}",
+        f"고객 문의: {query_preview}",
+        "",
+        f"관련 자료 {total_count}건 발견:",
+    ]
+    for result in search_results[:10]:
+        emoji = _SOURCE_META.get(result.source, ("📄", ""))[0]
+        fallback_lines.append(f"{emoji} {result.title}: {result.url}")
+    fallback_text = "\n".join(fallback_lines)
+
+    return blocks, fallback_text
